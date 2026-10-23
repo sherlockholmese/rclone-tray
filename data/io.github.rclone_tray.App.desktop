@@ -7,3 +7,4 @@ Icon=drive-harddisk
 Terminal=false
 Categories=Utility;FileTools;
 StartupNotify=true
+X-GNOME-UsesNotifications=true

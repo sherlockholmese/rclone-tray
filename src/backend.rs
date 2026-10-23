@@ -70,6 +70,7 @@ pub enum Request {
 
 pub enum Event {
     State(Snapshot),
+    Problem(String),
     Quit,
 }
 
@@ -117,13 +118,22 @@ pub fn start(paths: Paths, config: Config) -> (Sender<Request>, Receiver<Event>)
             let mut changed = false;
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(request) => {
+                    let report_problem = !worker.state.quitting
+                        && matches!(request, Request::Unmount(_) | Request::Delete(_));
                     worker.request(request);
+                    if report_problem && !worker.state.message.is_empty() {
+                        let _ = events.send(Event::Problem(worker.state.message.clone()));
+                    }
                     changed = true;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
+            let was_quitting = worker.state.quitting;
             changed |= worker.poll();
+            if was_quitting && !worker.state.quitting {
+                let _ = events.send(Event::Problem(worker.state.message.clone()));
+            }
             if worker.state.quitting && worker.mounts.is_empty() {
                 let _ = events.send(Event::Quit);
                 break;
@@ -800,8 +810,23 @@ mod tests {
                             return Err(error.clone());
                         }
                     }
+                    Ok(Event::Problem(_)) => {}
                     Ok(Event::Quit) => return Err("Worker quit unexpectedly".into()),
                     Err(e) => return Err(format!("Waiting for backend state: {e}")),
+                }
+            }
+        }
+        fn wait_problem(events: &Receiver<Event>) -> Result<String, String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(Event::Problem(problem)) => return Ok(problem),
+                    Ok(Event::State(_)) => {}
+                    _ => {
+                        return Err(
+                            "Backend did not report an action problem for notification".into()
+                        );
+                    }
                 }
             }
         }
@@ -902,9 +927,13 @@ mod tests {
                 .spawn()
                 .unwrap();
             tx.send(Request::Quit).unwrap();
+            let problem = wait_problem(&events);
             let paused = wait(&events, |s| s.message.contains("Quit paused"));
             drop(busy.stdin.take());
             busy.wait().unwrap();
+            if !problem?.contains("close open files") {
+                return Err("Busy-mount notification was not actionable".into());
+            }
             let paused = paused?;
             if paused.quitting || paused.statuses.get(&41) != Some(&Status::Mounted) {
                 return Err("Quit forced a busy mount or did not pause".into());
@@ -932,6 +961,9 @@ mod tests {
                     })
             })?;
             tx.send(Request::Unmount(41)).unwrap();
+            if !wait_problem(&events)?.contains("Uploads are still pending") {
+                return Err("Pending-upload notification was missing".into());
+            }
             let refused = wait(&events, |s| s.message.contains("Uploads are still pending"))?;
             if refused.statuses.get(&41) != Some(&Status::Mounted) {
                 return Err("Unmount proceeded with pending uploads".into());
@@ -981,6 +1013,7 @@ mod tests {
                             return Err(format!("Quit unexpectedly paused: {}", state.message));
                         }
                     }
+                    Ok(Event::Problem(problem)) => return Err(problem),
                     Err(error) => return Err(format!("Quit did not finish: {error}")),
                 }
             }

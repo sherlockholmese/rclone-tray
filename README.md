@@ -58,6 +58,21 @@ It does not read, copy, or manage cloud credentials. Encrypted rclone configurat
 rclone's supported noninteractive password setup (for example a password command);
 the app cannot answer terminal password prompts.
 
+## Notifications
+
+Native desktop notifications are enabled for mount/unmount results, slow startup,
+mount failures, blocked unmounts or Quit, cache exhaustion, upload retries, and completed
+upload batches. Clicking a notification opens the app while it is running. Notifications
+use the desktop's drive icon and follow its notification settings and Do Not Disturb mode.
+A notification service is required, such as Plasma/GNOME's built-in service, mako, or dunst.
+
+Routine polling, speed changes, and individual downloads do not produce notifications.
+Repeated events replace the previous notification of the same kind for that profile.
+Successful cleanup during Quit stays quiet; cleanup failures still alert. Upload completion
+requires previously observed pending uploads followed by a confirmed empty queue and cache
+status. Missing telemetry is never treated as completion, and an empty queue is not a
+guarantee that applications have closed or flushed all open files.
+
 ## Storage and safety
 
 - Profiles: `$XDG_CONFIG_HOME/rclone-tray/profiles.toml` (default `~/.config/...`).
@@ -155,9 +170,18 @@ The regular suite also covers startup recovery before VFS registration, slow sta
 unavailable telemetry, stale samples from a previous session, failed child processes,
 unsafe cancellation refusal, and tray rate aggregation with long profile names.
 
+The notification delivery test uses a private D-Bus service, with no display or desktop
+notification daemon. It checks the notification payload, icon, priority, replacement,
+and click action without showing real notifications:
+
+```sh
+dbus-run-session -- env -u DISPLAY -u WAYLAND_DISPLAY RCLONE_TRAY_TEST_BUS=1 \
+  cargo test native_notification_delivery_and_click -- --ignored --nocapture
+```
+
 For GTK Vulkan swapchain/presentation warnings, a one-run renderer diagnostic is
 `GSK_RENDERER=gl cargo run`. The app does not change your renderer or system theme settings.
 Desktop behavior and appearance need validation in your own session.
 
-Upcoming work: desktop notifications and richer recovery. Provider login remains
+Upcoming work: richer recovery. Provider login remains
 owned by `rclone config`.

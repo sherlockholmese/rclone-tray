@@ -2,6 +2,7 @@ use crate::{
     backend::{self, Event, Request, Snapshot, Status},
     config::{Config, Paths, Profile},
     control::{Activity, Transfer, byte_size},
+    notifications::{Notice, Notifications},
     style::{self, CONTROL_HEIGHT, FIELD_GAP, GAP, GROUP_GAP, INSET},
     tray::{Action, AppTray},
 };
@@ -105,6 +106,15 @@ pub fn build(app: &gtk::Application, paths: Paths, config: Config, background: b
         .default_height(480)
         .build();
     window.add_css_class("rclone-app");
+    let show = gio::SimpleAction::new("show", None);
+    let target = window.downgrade();
+    show.connect_activate(move |_, _| {
+        // Present during activation so GTK can use the desktop's activation token.
+        if let Some(window) = target.upgrade() {
+            window.present();
+        }
+    });
+    app.add_action(&show);
     let header = gtk::HeaderBar::new();
     let title = gtk::Label::new(Some("Rclone Tray"));
     title.add_css_class("title");
@@ -202,12 +212,16 @@ pub fn build(app: &gtk::Application, paths: Paths, config: Config, background: b
     let application = app.clone();
     let mut cards = HashMap::new();
     let mut queues = HashMap::<u64, QueueWindow>::new();
+    let mut notifications = Notifications::default();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let _keep_alive = &hold;
         queues.retain(|_, queue| queue.window.is_visible());
         while let Ok(event) = events.try_recv() {
             match event {
                 Event::State(snapshot) => {
+                    for notice in notifications.update(&snapshot) {
+                        notice.send(&application);
+                    }
                     message.set_text(&snapshot.message);
                     message.set_visible(!snapshot.message.is_empty());
                     quit.set_label(if snapshot.quitting {
@@ -227,6 +241,7 @@ pub fn build(app: &gtk::Application, paths: Paths, config: Config, background: b
                     }
                     *state.borrow_mut() = snapshot;
                 }
+                Event::Problem(problem) => Notice::problem(&problem).send(&application),
                 Event::Quit => {
                     if let Some(tray) = &tray {
                         let _ = tray.shutdown();

@@ -1,6 +1,7 @@
 mod backend;
 mod config;
 mod control;
+mod notifications;
 mod style;
 mod tray;
 mod ui;
