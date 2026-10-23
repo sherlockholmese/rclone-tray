@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Rclone Tray
+Comment=Mount your configured rclone remotes from the system tray
+Exec=rclone-tray
+Icon=drive-harddisk
+Terminal=false
+Categories=Utility;FileTools;
+StartupNotify=true

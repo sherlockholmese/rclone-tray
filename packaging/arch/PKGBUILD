@@ -1,0 +1,32 @@
+pkgname=rclone-tray
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Native GTK tray application for mounting configured rclone remotes'
+arch=('x86_64' 'aarch64')
+# No project license has been chosen. This recipe is for local builds only.
+license=('LicenseRef-Unknown')
+depends=('gtk4' 'rclone' 'fuse3' 'util-linux')
+makedepends=('cargo' 'pkgconf' 'desktop-file-utils')
+optdepends=('gnome-shell-extension-appindicator: tray support on GNOME')
+source=("$pkgname-$pkgver.tar.gz")
+# build.sh appends the checksum of the current local source snapshot.
+
+build() {
+    cargo build --release --locked --manifest-path "$srcdir/$pkgname-$pkgver/Cargo.toml" \
+        --target-dir "$srcdir/$pkgname-$pkgver/target"
+}
+
+check() {
+    cargo test --locked --manifest-path "$srcdir/$pkgname-$pkgver/Cargo.toml" \
+        --target-dir "$srcdir/$pkgname-$pkgver/target"
+    desktop-file-validate "$srcdir/$pkgname-$pkgver/data/io.github.rclone_tray.App.desktop"
+}
+
+package() {
+    install -Dm755 "$srcdir/$pkgname-$pkgver/target/release/rclone-tray" \
+        "$pkgdir/usr/bin/rclone-tray"
+    install -Dm644 "$srcdir/$pkgname-$pkgver/data/io.github.rclone_tray.App.desktop" \
+        "$pkgdir/usr/share/applications/io.github.rclone_tray.App.desktop"
+    install -Dm644 "$srcdir/$pkgname-$pkgver/README.md" \
+        "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
