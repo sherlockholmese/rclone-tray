@@ -12,7 +12,7 @@ pub struct Profile {
     pub mount_at_start: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub profiles: Vec<Profile>,
 }
@@ -62,7 +62,9 @@ impl Paths {
 
     pub fn set_autostart(&self, enabled: bool) -> Result<(), String> {
         if enabled {
-            let executable = env::current_exe().map_err(|e| e.to_string())?;
+            let executable = env::current_exe()
+                .map_err(|e| e.to_string())?
+                .with_file_name("rclone-tray");
             let escaped = executable
                 .to_string_lossy()
                 .replace('\\', "\\\\")

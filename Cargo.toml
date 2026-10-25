@@ -2,9 +2,17 @@
 name = "rclone-tray"
 version = "0.1.0"
 edition = "2024"
+default-run = "rclone-tray"
+
+[[bin]]
+name = "rclone-tray-ui"
+path = "src/ui_main.rs"
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.11" }
+gio = "0.22"
+glib = "0.22"
+serde_json = "1"
 ksni = { version = "0.3.7", features = ["blocking"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }

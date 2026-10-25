@@ -25,6 +25,8 @@ check() {
 package() {
     install -Dm755 "$srcdir/$pkgname-$pkgver/target/release/rclone-tray" \
         "$pkgdir/usr/bin/rclone-tray"
+    install -Dm755 "$srcdir/$pkgname-$pkgver/target/release/rclone-tray-ui" \
+        "$pkgdir/usr/bin/rclone-tray-ui"
     install -Dm644 "$srcdir/$pkgname-$pkgver/data/io.github.rclone_tray.App.desktop" \
         "$pkgdir/usr/share/applications/io.github.rclone_tray.App.desktop"
     install -Dm644 "$srcdir/$pkgname-$pkgver/README.md" \

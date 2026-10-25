@@ -998,10 +998,13 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "rclone-tray"
 version = "0.1.0"
 dependencies = [
+ "gio",
+ "glib",
  "gtk4",
  "ksni",
  "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
 ]

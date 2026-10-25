@@ -3,7 +3,7 @@ use crate::{
     backend::{Snapshot, Status},
     config::Profile,
 };
-use gtk::gio::{self, prelude::*};
+use gio::{self, prelude::*};
 use std::collections::HashMap;
 
 pub struct Notice {
@@ -182,7 +182,6 @@ mod tests {
         config::Config,
         control::{Activity, Cache, QueuedUpload, Transfer},
     };
-    use gtk::glib;
 
     fn snapshot(status: Status) -> Snapshot {
         Snapshot {

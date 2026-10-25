@@ -6,7 +6,7 @@ use ksni::{
 };
 use std::sync::mpsc::Sender;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     Show,
     Mount(u64),

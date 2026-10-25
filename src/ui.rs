@@ -1,13 +1,12 @@
 use crate::{
     backend::{self, Event, Request, Snapshot, Status},
-    config::{Config, Paths, Profile},
+    config::{Paths, Profile},
     control::{Activity, Transfer, byte_size},
-    notifications::{Notice, Notifications},
+    ipc,
     style::{self, CONTROL_HEIGHT, FIELD_GAP, GAP, GROUP_GAP, INSET},
-    tray::{Action, AppTray},
+    tray::Action,
 };
 use gtk::{gio, glib, prelude::*};
-use ksni::blocking::TrayMethods;
 use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::mpsc, time::Duration};
 
 struct MountCard {
@@ -87,18 +86,22 @@ impl MountCard {
     }
 }
 
-pub fn build(app: &gtk::Application, paths: Paths, config: Config, background: bool) {
+pub fn build(app: &gtk::Application, paths: Paths, snapshot: Snapshot) {
     style::install();
-    let (requests, events) = backend::start(paths.clone(), config.clone());
+    let (requests, events) = ipc::connect(ipc::socket_path(&paths));
     let (actions, action_rx) = mpsc::channel();
-    let state = Rc::new(RefCell::new(Snapshot {
-        config,
-        remotes: vec![],
-        statuses: Default::default(),
-        activity: Default::default(),
-        message: "Discovering rclone remotes…".into(),
-        quitting: false,
-    }));
+    let state = Rc::new(RefCell::new(snapshot));
+    let dispatch = gio::SimpleAction::new("dispatch", Some(glib::VariantTy::STRING));
+    let dispatch_tx = actions.clone();
+    dispatch.connect_activate(move |_, parameter| {
+        if let Some(action) = parameter
+            .and_then(|p| p.str())
+            .and_then(|json| serde_json::from_str::<Action>(json).ok())
+        {
+            let _ = dispatch_tx.send(action);
+        }
+    });
+    app.add_action(&dispatch);
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Rclone Tray")
@@ -106,15 +109,6 @@ pub fn build(app: &gtk::Application, paths: Paths, config: Config, background: b
         .default_height(480)
         .build();
     window.add_css_class("rclone-app");
-    let show = gio::SimpleAction::new("show", None);
-    let target = window.downgrade();
-    show.connect_activate(move |_, _| {
-        // Present during activation so GTK can use the desktop's activation token.
-        if let Some(window) = target.upgrade() {
-            window.present();
-        }
-    });
-    app.add_action(&show);
     let header = gtk::HeaderBar::new();
     let title = gtk::Label::new(Some("Rclone Tray"));
     title.add_css_class("title");
@@ -185,43 +179,20 @@ pub fn build(app: &gtk::Application, paths: Paths, config: Config, background: b
     let tx = requests.clone();
     add.connect_clicked(move |_| editor(&editor_window, &editor_state.borrow(), None, tx.clone()));
 
-    let tray = AppTray {
-        state: state.borrow().clone(),
-        actions: actions.clone(),
-    }
-    .spawn();
-    let tray = match tray {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            eprintln!("Tray unavailable: {e}. The settings window remains available.");
-            None
-        }
-    };
-    let tray_available = tray.is_some();
-    window.connect_close_request(move |window| {
-        // Without a tray host, retain a way to reach active mounts and Quit.
-        if tray_available {
-            window.set_visible(false);
-        }
-        glib::Propagation::Stop
+    let application = app.clone();
+    window.connect_close_request(move |_| {
+        application.quit();
+        glib::Propagation::Proceed
     });
-    if !background || !tray_available {
-        window.present();
-    }
-    let hold = app.hold();
+    window.present();
     let application = app.clone();
     let mut cards = HashMap::new();
     let mut queues = HashMap::<u64, QueueWindow>::new();
-    let mut notifications = Notifications::default();
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        let _keep_alive = &hold;
         queues.retain(|_, queue| queue.window.is_visible());
         while let Ok(event) = events.try_recv() {
             match event {
                 Event::State(snapshot) => {
-                    for notice in notifications.update(&snapshot) {
-                        notice.send(&application);
-                    }
                     message.set_text(&snapshot.message);
                     message.set_visible(!snapshot.message.is_empty());
                     quit.set_label(if snapshot.quitting {
@@ -236,16 +207,13 @@ pub fn build(app: &gtk::Application, paths: Paths, config: Config, background: b
                     for (&id, queue) in &queues {
                         queue.update(&snapshot, id);
                     }
-                    if let Some(tray) = &tray {
-                        tray.update(|t| t.state = snapshot.clone());
-                    }
                     *state.borrow_mut() = snapshot;
                 }
-                Event::Problem(problem) => Notice::problem(&problem).send(&application),
+                Event::Problem(problem) => {
+                    message.set_text(&problem);
+                    message.set_visible(true);
+                }
                 Event::Quit => {
-                    if let Some(tray) = &tray {
-                        let _ = tray.shutdown();
-                    }
                     application.quit();
                     return glib::ControlFlow::Break;
                 }

@@ -9,7 +9,7 @@ This is an initial MVP, not an offline-sync or conflict-resolution engine.
 - `rclone`, FUSE3 (`fusermount3`), and permission to access `/dev/fuse`.
 - A graphical Linux session with D-Bus. A StatusNotifierItem tray host is recommended
   (for example KDE's tray, Waybar's tray module, or GNOME's AppIndicator extension).
-  Without a tray host the main window remains available; use **Quit** to exit.
+  Without a tray host the settings window opens; use **Quit** to stop the backend.
 - `kill` from the usual Linux process utilities, used only for graceful cancellation
   of a mount that has not become ready.
 
@@ -21,6 +21,7 @@ and a sufficiently recent Rust toolchain through rustup.
 
 ```sh
 rclone config              # configure accounts separately, if needed
+cargo build                 # builds the backend and on-demand settings binary
 cargo run
 # Or start hidden if a supported tray host is available:
 cargo run -- --background
@@ -104,7 +105,14 @@ The app cannot inspect transfer activity for mounts left by another session. If 
 unavailable indefinitely, inspect the original rclone process and logs before manually
 unmounting in a terminal.
 
-Closing the window hides it when a tray is available. **Quit** waits for pending uploads
+The tray/backend (`rclone-tray`) does not load GTK. It owns mounts, telemetry, and
+notifications. Settings and queue windows run in a separate, on-demand `rclone-tray-ui`
+process, communicating over a user-private Unix socket. Closing the main window exits
+that GTK process and frees its memory; mounts and tray status continue running.
+Reopening settings reconnects to the same backend without remounting.
+Per-mount rclone processes and their VFS caches still use additional memory.
+
+**Quit** waits for pending uploads
 and available cache status, normally unmounts each profile owned by this session, waits
 for its rclone process to exit, then closes the app. **Cancel quit** stops waiting without
 reversing unmounts already in progress. Busy mounts or cleanup failures pause Quit so you
@@ -119,11 +127,13 @@ silently taking ownership or killing them. Inspect the original process and use
 ```sh
 cargo build --release
 install -Dm755 target/release/rclone-tray ~/.local/bin/rclone-tray
+install -Dm755 target/release/rclone-tray-ui ~/.local/bin/rclone-tray-ui
 install -Dm644 data/io.github.rclone_tray.App.desktop \
   ~/.local/share/applications/io.github.rclone_tray.App.desktop
 ```
 
-Ensure `~/.local/bin` is on your desktop session's `PATH`.
+Keep both binaries in the same directory. Ensure `~/.local/bin` is on your desktop
+session's `PATH`. Autostart launches only the lightweight backend.
 
 ### Arch Linux package
 
@@ -138,7 +148,7 @@ sudo pacman -U target/arch/rclone-tray-0.1.0-1-x86_64.pkg.tar.zst
 
 The helper snapshots the current local sources, creates a checksummed PKGBUILD in
 `target/arch`, builds in release mode, runs headless tests and desktop-entry validation,
-and packages the executable, desktop entry, and README. It does not install anything,
+and packages both executables, desktop entry, and README. It does not install anything,
 request sudo, or touch running mounts. Run it again after changes. The recipe also
 allows native aarch64 builds; that architecture has not been tested here.
 

@@ -1,6 +1,6 @@
 //! Per-mount authenticated loopback RC connection. Credentials never enter logs or argv.
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
     net::TcpListener,
@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Transfer {
     pub name: String,
@@ -36,7 +36,7 @@ impl Transfer {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Cache {
     pub bytes_used: u64,
@@ -46,7 +46,7 @@ pub struct Cache {
     pub out_of_space: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct QueuedUpload {
     pub name: String,
     pub size: i64,
@@ -55,7 +55,7 @@ pub struct QueuedUpload {
     pub uploading: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Activity {
     pub transfers: Vec<Transfer>,
     // The VFS cache may not be registered yet while rclone recovers cached writes.

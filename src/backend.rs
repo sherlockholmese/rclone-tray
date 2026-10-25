@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     Unmounted,
     Mounting,
@@ -48,7 +48,7 @@ impl Status {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub config: Config,
     pub remotes: Vec<String>,
