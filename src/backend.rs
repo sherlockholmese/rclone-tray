@@ -260,7 +260,7 @@ impl Worker {
                 if self.mounts.contains_key(&id)
                     || self.state.statuses.get(&id).is_some_and(Status::active)
                 {
-                    self.state.message = "Unmount the profile before deleting it.".into();
+                    self.state.message = "Unmount this before removing it.".into();
                     return;
                 }
                 let mut config = self.state.config.clone();
@@ -535,7 +535,7 @@ impl Worker {
 
 pub fn validate(profile: &Profile, remotes: &[String]) -> Result<(), String> {
     if profile.name.trim().is_empty() {
-        return Err("Give this profile a name.".into());
+        return Err("Give this mount a name.".into());
     }
     if !remotes.contains(&profile.remote) {
         return Err("Choose an existing rclone remote, or refresh remotes.".into());

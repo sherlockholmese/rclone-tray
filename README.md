@@ -27,21 +27,29 @@ cargo run
 cargo run -- --background
 ```
 
-Click **Add mount**, choose a configured remote, optionally enter a remote subfolder,
+Click **+** (Ctrl+N), choose a configured remote, optionally enter a remote subfolder,
 and choose an absolute empty local directory. A missing directory is created on mount.
 The tray menu and main window both offer mount, open folder, log, and unmount actions.
 Re-launching the application opens the existing instance rather than starting duplicate mounts.
 
-Mount cards show aggregate upload/download speeds, cache usage, queued uploads, and errors.
-**Queue…** opens Uploads and Downloads tabs with file names, transferred bytes, speeds,
-and progress bars when the size is known. Waiting uploads show their size, delay, and retry
-attempts. Downloads are on demand: rclone exposes active downloads, not a waiting download
+The main window is one list of mounts. A filled dot means mounted, a ring means unmounted, a
+spinner means working, and a warning sign means something needs you. Live speeds, queued uploads,
+and problems appear on the row only when there is something to report, and the line under a row
+fills with the progress of its active transfers. The header sums up every mount. Unknown file
+sizes are left out of that line rather than estimated.
+
+Select a mount for its details: unmount, edit, remove, and **Uploads**, **Downloads**, and
+**Log** tabs. Queues list file names, transferred bytes, speeds, and progress when the size is
+known, with moving files first. Waiting uploads show their size, delay, and retry attempts.
+Escape or Alt+Left returns to the list. **Refresh remotes** (F5), **Start at login**, and
+**Quit…** (Ctrl+Q) are in the window menu. Downloads are on demand: rclone exposes active downloads, not a waiting download
 queue. Missing queue data is shown as unavailable, never as an empty queue. Polling runs
 off the UI thread, roughly once per second; lists are virtualized for large queues.
-The tray tooltip and menu show combined upload/download speeds, including startup recovery.
-Each profile's submenu has separate **Upload** and **Download** speed rows so long account
-names do not crowd out the numbers. The tray keeps the desktop theme's `drive-harddisk` icon;
-whether its title is shown next to the icon depends on the tray host.
+The tray tooltip and menu show the same summary, including startup recovery. Each mount's menu
+label starts with the status mark, so hosts that clip long labels cannot hide it. Its submenu
+states the status and any live speeds, then the available actions. The tray keeps the desktop
+theme's `drive-harddisk` icon and asks for attention when a mount fails; how that looks, and
+whether its title is shown next to the icon, depends on the tray host.
 Very short transfers can finish between samples, and cached reads need no download.
 Older rclone versions without direction metadata show “Transferring” rather than guessing.
 “No active transfers” is not a guarantee that every open file has reached the remote.

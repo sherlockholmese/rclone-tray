@@ -1,4 +1,4 @@
-use rclone_tray::{backend, config, control, ipc, tray};
+use rclone_tray::{backend, config, control, ipc, tray, view};
 mod style;
 mod ui;
 use gtk::{gio, glib, prelude::*};
@@ -21,14 +21,17 @@ fn main() -> glib::ExitCode {
             Err(error) => {
                 let window = gtk::ApplicationWindow::builder()
                     .application(app)
-                    .title("Rclone Tray — connection error")
-                    .default_width(520)
-                    .default_height(180)
+                    .title("Rclone Tray isn’t running")
+                    .default_width(480)
+                    .default_height(160)
                     .build();
-                let label = gtk::Label::new(Some(&format!("{error}\n\nStart rclone-tray first.")));
+                let label = gtk::Label::new(Some(&format!(
+                    "Start rclone-tray, then open this window again.\n\n{error}"
+                )));
                 label.set_wrap(true);
-                label.set_margin_start(24);
-                label.set_margin_end(24);
+                label.set_max_width_chars(60);
+                label.set_selectable(true);
+                style::inset(&label, 24, 24);
                 window.set_child(Some(&label));
                 window.present();
             }

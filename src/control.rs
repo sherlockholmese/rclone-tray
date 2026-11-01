@@ -70,20 +70,6 @@ pub struct Rates {
     pub other: f64,
 }
 
-impl Rates {
-    pub fn label(&self) -> String {
-        let mut label = format!(
-            "↑ {}/s - ↓ {}/s",
-            byte_size(self.upload),
-            byte_size(self.download)
-        );
-        if self.other > 0.0 {
-            label.push_str(&format!(" - Other {}/s", byte_size(self.other)));
-        }
-        label
-    }
-}
-
 impl Activity {
     pub fn rates(&self) -> Rates {
         let mut rates = Rates::default();

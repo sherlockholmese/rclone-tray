@@ -1,5 +1,6 @@
 use crate::backend::{Snapshot, Status};
-use crate::control::{Rates, byte_size};
+use crate::control::byte_size;
+use crate::view::{self, Primary};
 use ksni::{
     MenuItem, Tray,
     menu::{StandardItem, SubMenu},
@@ -23,36 +24,53 @@ pub struct AppTray {
 }
 
 impl AppTray {
-    fn transfer_summary(&self) -> String {
-        let mut rates = Rates::default();
-        let mut known = 0;
-        let mut unavailable = 0;
-        for (id, status) in &self.state.statuses {
-            if !status.active() {
-                continue;
-            }
-            match self
-                .state
-                .activity
-                .get(id)
-                .filter(|_| *status != Status::External)
-            {
-                Some(Ok(activity)) => {
-                    let mount = activity.rates();
-                    rates.upload += mount.upload;
-                    rates.download += mount.download;
-                    rates.other += mount.other;
-                    known += 1;
+    fn summary(&self) -> String {
+        let overview = view::overview(&self.state);
+        if overview.detail.is_empty() {
+            overview.headline
+        } else {
+            format!("{} · {}", overview.headline, overview.detail)
+        }
+    }
+
+    fn mount_menu(&self, id: u64, status: &Status) -> Vec<MenuItem<Self>> {
+        let sample = self.state.activity.get(&id);
+        let mut children = vec![note(status.label()).into()];
+        if status.active() && *status != Status::External {
+            if let Some(Ok(activity)) = sample {
+                let rates = activity.rates();
+                for (name, rate) in [
+                    ("Upload", rates.upload),
+                    ("Download", rates.download),
+                    ("Other", rates.other),
+                ] {
+                    if rate > 0.0 {
+                        children.push(note(&format!("{name} {}/s", byte_size(rate))).into());
+                    }
                 }
-                _ => unavailable += 1,
+                if let Some(count) = view::queued_uploads(activity).filter(|count| *count > 0) {
+                    children.push(note(&format!("{count} queued")).into());
+                }
+            } else {
+                children.push(note("Transfer status unavailable").into());
             }
         }
-        match (known, unavailable) {
-            (0, 0) => "No active mounts".into(),
-            (0, _) => "Transfer status unavailable".into(),
-            (_, 0) => rates.label(),
-            _ => format!("{} - {unavailable} unavailable", rates.label()),
+        if let Some(warning) = view::cache_warning(sample) {
+            children.push(note(warning).into());
         }
+        children.push(MenuItem::Separator);
+        match view::primary(status) {
+            Primary::Open => children.push(item("Open folder", Action::Open(id)).into()),
+            Primary::Mount => children.push(item("Mount", Action::Mount(id)).into()),
+            Primary::Cancel => children.push(item("Cancel mount…", Action::Unmount(id)).into()),
+            Primary::Unavailable => {}
+        }
+        if *status == Status::Mounted {
+            children.push(item("Unmount…", Action::Unmount(id)).into());
+        }
+        children.push(item("Details…", Action::Queue(id)).into());
+        children.push(item("View log", Action::Log(id)).into());
+        children
     }
 }
 
@@ -61,12 +79,24 @@ impl Tray for AppTray {
         "rclone-tray".into()
     }
     fn title(&self) -> String {
-        format!("Rclone Tray — {}", self.transfer_summary())
+        format!("Rclone Tray — {}", self.summary())
+    }
+    fn status(&self) -> ksni::Status {
+        if self
+            .state
+            .statuses
+            .values()
+            .any(|status| matches!(status, Status::Error(_)))
+        {
+            ksni::Status::NeedsAttention
+        } else {
+            ksni::Status::Active
+        }
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             title: "Rclone Tray".into(),
-            description: self.transfer_summary(),
+            description: self.summary(),
             icon_name: self.icon_name(),
             ..Default::default()
         }
@@ -82,108 +112,26 @@ impl Tray for AppTray {
         true
     }
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let mut menu = vec![
-            StandardItem {
-                label: self.transfer_summary(),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-            item("Mounts & settings…", Action::Show).into(),
-            MenuItem::Separator,
-        ];
+        let mut menu = vec![note(&self.summary()).into(), MenuItem::Separator];
         if self.state.config.profiles.is_empty() {
-            menu.push(
-                StandardItem {
-                    label: "No mount profiles yet".into(),
-                    enabled: false,
-                    ..Default::default()
-                }
-                .into(),
-            );
+            menu.push(note("No mounts yet").into());
         }
+        // Lead with the mark: menu hosts clip long labels from the end.
         for profile in &self.state.config.profiles {
             let id = profile.id;
             let status = self.state.statuses.get(&id).unwrap_or(&Status::Unmounted);
-            let mut children = vec![];
-            match self.state.activity.get(&id) {
-                Some(Ok(activity)) if status.active() && *status != Status::External => {
-                    let rates = activity.rates();
-                    for label in [
-                        format!("Upload {}/s", byte_size(rates.upload)),
-                        format!("Download {}/s", byte_size(rates.download)),
-                    ] {
-                        children.push(
-                            StandardItem {
-                                label,
-                                enabled: false,
-                                ..Default::default()
-                            }
-                            .into(),
-                        );
-                    }
-                    if rates.other > 0.0 {
-                        children.push(
-                            StandardItem {
-                                label: format!("Other {}/s", byte_size(rates.other)),
-                                enabled: false,
-                                ..Default::default()
-                            }
-                            .into(),
-                        );
-                    }
-                    if let Ok(cache) = &activity.cache
-                        && cache.uploads_queued > 0
-                    {
-                        children.push(
-                            StandardItem {
-                                label: format!("{} uploads queued", cache.uploads_queued),
-                                enabled: false,
-                                ..Default::default()
-                            }
-                            .into(),
-                        );
-                    }
-                }
-                _ if status.active() => {
-                    children.push(
-                        StandardItem {
-                            label: "Transfer status unavailable".into(),
-                            enabled: false,
-                            ..Default::default()
-                        }
-                        .into(),
-                    );
-                }
-                _ => {}
-            }
-            children.push(item("View status", Action::Show).into());
-            children.push(item("Transfer queue…", Action::Queue(id)).into());
-            match status {
-                Status::Mounted => {
-                    children.push(item("Open folder", Action::Open(id)).into());
-                    children.push(item("Unmount…", Action::Unmount(id)).into());
-                }
-                Status::Unmounted | Status::Error(_) => {
-                    children.push(item("Mount", Action::Mount(id)).into())
-                }
-                Status::Mounting | Status::Recovering | Status::Waiting => {
-                    children.push(item("Cancel mount…", Action::Unmount(id)).into())
-                }
-                _ => {}
-            }
-            children.push(item("View log", Action::Log(id)).into());
+            let (_, tone) = view::activity_line(status, self.state.activity.get(&id));
             menu.push(
                 SubMenu {
-                    label: format!("{} — {}", profile.name, status.label()),
-                    submenu: children,
+                    label: format!("{}  {}", tone.mark(), profile.name),
+                    submenu: self.mount_menu(id, status),
                     ..Default::default()
                 }
                 .into(),
             );
         }
         menu.push(MenuItem::Separator);
+        menu.push(item("Open Rclone Tray", Action::Show).into());
         menu.push(
             item(
                 if self.state.quitting {
@@ -196,6 +144,14 @@ impl Tray for AppTray {
             .into(),
         );
         menu
+    }
+}
+
+fn note(label: &str) -> StandardItem<AppTray> {
+    StandardItem {
+        label: label.into(),
+        enabled: false,
+        ..Default::default()
     }
 }
 
@@ -282,7 +238,7 @@ mod tests {
         };
         assert_eq!(
             tray.tool_tip().description,
-            "↑ 3.0 KiB/s - ↓ 3.5 KiB/s - 1 unavailable"
+            "1 of 2 mounted · ↑ 3.0 KiB/s  ↓ 3.5 KiB/s"
         );
         let menu = tray.menu();
         let profile_menus: Vec<_> = menu
@@ -294,9 +250,9 @@ mod tests {
             .collect();
         assert_eq!(
             profile_menus[0].label,
-            "A deliberately long account name — Mounted"
+            "●  A deliberately long account name"
         );
-        assert_eq!(profile_menus[1].label, "Recovery — Recovering cache…");
+        assert_eq!(profile_menus[1].label, "◌  Recovery");
         let labels: Vec<_> = profile_menus[1]
             .submenu
             .iter()
@@ -305,12 +261,21 @@ mod tests {
                 _ => None,
             })
             .collect();
+        assert!(labels.contains(&"Recovering cache…"));
         assert!(labels.contains(&"Upload 2.0 KiB/s"));
         assert!(labels.contains(&"Download 512 B/s"));
         tray.state.activity.clear();
-        assert_eq!(tray.tool_tip().description, "Transfer status unavailable");
+        assert_eq!(
+            tray.tool_tip().description,
+            "1 of 2 mounted · Activity unavailable"
+        );
+        assert_eq!(tray.status(), ksni::Status::Active);
+        tray.state
+            .statuses
+            .insert(1, Status::Error("failed".into()));
+        assert_eq!(tray.status(), ksni::Status::NeedsAttention);
         tray.state.statuses.clear();
-        assert_eq!(tray.tool_tip().description, "No active mounts");
+        assert_eq!(tray.tool_tip().description, "0 of 2 mounted");
         tray.state.statuses.insert(1, Status::Mounted);
         tray.state.activity.insert(
             1,
@@ -320,7 +285,10 @@ mod tests {
                 transfers: vec![],
             }),
         );
-        assert_eq!(tray.tool_tip().description, "↑ 0 B/s - ↓ 0 B/s");
+        assert_eq!(
+            tray.tool_tip().description,
+            "1 of 2 mounted · No uploads queued"
+        );
         assert_eq!(tray.icon_name(), "drive-harddisk");
     }
 }
