@@ -1,4 +1,4 @@
-//! Private, local request/response transport. No GTK objects or rclone credentials cross it.
+//! Private, local request/response transport. No UI objects or rclone credentials cross it.
 use crate::{
     backend::{Event, Request, Snapshot},
     config::{Paths, Profile},
@@ -29,7 +29,9 @@ enum Command {
     Delete(u64),
     Mount(u64),
     Unmount(u64),
+    ClearCache(u64),
     Quit,
+    QuitNow,
     CancelQuit,
 }
 
@@ -37,6 +39,7 @@ enum Command {
 enum Reply {
     State(Snapshot),
     Result(Result<(), String>),
+    Cleared(Result<u64, String>),
 }
 
 pub fn socket_path(paths: &Paths) -> PathBuf {
@@ -114,6 +117,18 @@ impl Server {
                                         .and_then(|result| result);
                                     Reply::Result(result)
                                 }
+                                Command::ClearCache(id) => {
+                                    let (tx, rx) = mpsc::channel();
+                                    let result = requests
+                                        .send(Request::ClearCache(id, tx))
+                                        .map_err(|_| "Backend stopped".to_string())
+                                        .and_then(|()| {
+                                            rx.recv_timeout(Duration::from_secs(8))
+                                                .map_err(|e| e.to_string())
+                                        })
+                                        .and_then(|result| result);
+                                    Reply::Cleared(result)
+                                }
                                 command => {
                                     let request = match command {
                                         Command::Refresh => Request::Refresh,
@@ -121,6 +136,7 @@ impl Server {
                                         Command::Mount(id) => Request::Mount(id),
                                         Command::Unmount(id) => Request::Unmount(id),
                                         Command::Quit => Request::Quit,
+                                        Command::QuitNow => Request::QuitNow,
                                         Command::CancelQuit => Request::CancelQuit,
                                         _ => unreachable!(),
                                     };
@@ -222,6 +238,14 @@ pub fn connect(path: PathBuf) -> (Sender<Request>, Receiver<Event>) {
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            if let Request::ClearCache(id, cleared) = request {
+                let result = call(&path, Command::ClearCache(id)).and_then(|reply| match reply {
+                    Reply::Cleared(result) => result,
+                    _ => Err("Unexpected backend reply".into()),
+                });
+                let _ = cleared.send(result);
+                continue;
+            }
             let (command, saved) = match request {
                 Request::Refresh => (Command::Refresh, None),
                 Request::Save(profile, tx) => (Command::Save(profile), Some(tx)),
@@ -229,7 +253,9 @@ pub fn connect(path: PathBuf) -> (Sender<Request>, Receiver<Event>) {
                 Request::Mount(id) => (Command::Mount(id), None),
                 Request::Unmount(id) => (Command::Unmount(id), None),
                 Request::Quit => (Command::Quit, None),
+                Request::QuitNow => (Command::QuitNow, None),
                 Request::CancelQuit => (Command::CancelQuit, None),
+                Request::ClearCache(..) => unreachable!(),
             };
             let result = call(&path, command).and_then(|reply| match reply {
                 Reply::Result(result) => result,
@@ -243,6 +269,61 @@ pub fn connect(path: PathBuf) -> (Sender<Request>, Receiver<Event>) {
         }
     });
     (tx, receiver)
+}
+
+/// The first settings window owns this lock and socket. Later launches hand their request
+/// to it and exit, so the tray never opens a second window.
+pub enum Instance {
+    Primary(Receiver<String>, InstanceGuard),
+    Forwarded,
+}
+
+pub struct InstanceGuard {
+    _lock: File,
+}
+
+pub fn claim_ui(paths: &Paths, message: &str) -> io::Result<Instance> {
+    let control = socket_path(paths);
+    let directory = control.parent().unwrap();
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join("ui.lock"))?;
+    let path = directory.join("ui.sock");
+    if lock.try_lock().is_err() {
+        let mut stream = UnixStream::connect(&path)?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(message.as_bytes())?;
+        stream.write_all(b"\n")?;
+        return Ok(Instance::Forwarded);
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => (),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    let listener = UnixListener::bind(&path)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut line = String::new();
+            if std::io::Read::take(BufReader::new(&stream), 64 * 1024)
+                .read_line(&mut line)
+                .is_ok()
+                && tx.send(line.trim().to_string()).is_err()
+            {
+                break;
+            }
+        }
+    });
+    Ok(Instance::Primary(rx, InstanceGuard { _lock: lock }))
 }
 
 #[cfg(test)]
@@ -340,5 +421,29 @@ mod tests {
         assert!(snapshot(&path).unwrap() == *state.lock().unwrap());
         drop(restarted);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_second_settings_window_hands_its_request_to_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config: dir.path().join("config/rclone-tray/profiles.toml"),
+            cache: dir.path().join("cache"),
+            logs: dir.path().join("logs"),
+            autostart: dir.path().join("autostart.desktop"),
+        };
+        // SAFETY: tests in this module do not read XDG_RUNTIME_DIR concurrently.
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+        let Instance::Primary(requests, _guard) = claim_ui(&paths, "first").unwrap() else {
+            panic!("The first window owns the instance")
+        };
+        assert!(matches!(
+            claim_ui(&paths, "{\"Log\":7}").unwrap(),
+            Instance::Forwarded
+        ));
+        assert_eq!(
+            requests.recv_timeout(Duration::from_secs(3)).unwrap(),
+            "{\"Log\":7}"
+        );
     }
 }

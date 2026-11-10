@@ -16,6 +16,7 @@ pub enum Action {
     Queue(u64),
     Log(u64),
     Quit,
+    QuitNow,
 }
 
 pub struct AppTray {
@@ -25,12 +26,7 @@ pub struct AppTray {
 
 impl AppTray {
     fn summary(&self) -> String {
-        let overview = view::overview(&self.state);
-        if overview.detail.is_empty() {
-            overview.headline
-        } else {
-            format!("{} · {}", overview.headline, overview.detail)
-        }
+        view::overview(&self.state).summary()
     }
 
     fn mount_menu(&self, id: u64, status: &Status) -> Vec<MenuItem<Self>> {
@@ -132,6 +128,9 @@ impl Tray for AppTray {
         }
         menu.push(MenuItem::Separator);
         menu.push(item("Open Rclone Tray", Action::Show).into());
+        if self.state.quitting {
+            menu.push(item("Quit now", Action::QuitNow).into());
+        }
         menu.push(
             item(
                 if self.state.quitting {
@@ -238,7 +237,7 @@ mod tests {
         };
         assert_eq!(
             tray.tool_tip().description,
-            "1 of 2 mounted · ↑ 3.0 KiB/s  ↓ 3.5 KiB/s"
+            "1 of 2 mounted, ↑ 3.0 KiB/s, ↓ 3.5 KiB/s"
         );
         let menu = tray.menu();
         let profile_menus: Vec<_> = menu
@@ -267,7 +266,7 @@ mod tests {
         tray.state.activity.clear();
         assert_eq!(
             tray.tool_tip().description,
-            "1 of 2 mounted · Activity unavailable"
+            "1 of 2 mounted, Activity unavailable"
         );
         assert_eq!(tray.status(), ksni::Status::Active);
         tray.state
@@ -287,7 +286,7 @@ mod tests {
         );
         assert_eq!(
             tray.tool_tip().description,
-            "1 of 2 mounted · No uploads queued"
+            "1 of 2 mounted, No uploads queued"
         );
         assert_eq!(tray.icon_name(), "drive-harddisk");
     }

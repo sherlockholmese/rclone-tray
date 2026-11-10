@@ -64,6 +64,11 @@ pub enum Request {
     Delete(u64),
     Mount(u64),
     Unmount(u64),
+    /// Quit without waiting for uploads. rclone keeps pending writes in the cache and
+    /// resumes them on the next mount of the unchanged profile.
+    QuitNow,
+    /// Deletes an unmounted profile's VFS cache and replies with the bytes freed.
+    ClearCache(u64, Sender<Result<u64, String>>),
     Quit,
     CancelQuit,
 }
@@ -74,10 +79,16 @@ pub enum Event {
     Quit,
 }
 
+/// How long rclone may keep running after its folder is unmounted before it is asked to exit.
+const EXIT_GRACE: Duration = Duration::from_secs(20);
+
 struct Mount {
     child: Child,
     started: Instant,
     unmounting: bool,
+    /// When the unmount was requested, and whether rclone was then asked to exit.
+    unmount_started: Option<Instant>,
+    terminated: bool,
     control: Control,
     _monitor: Sender<()>,
 }
@@ -98,6 +109,7 @@ pub fn start(paths: Paths, config: Config) -> (Sender<Request>, Receiver<Event>)
                 quitting: false,
             },
             mounts: HashMap::new(),
+            force_quit: false,
             updates,
             activity_rx,
         };
@@ -150,6 +162,8 @@ struct Worker {
     paths: Paths,
     state: Snapshot,
     mounts: HashMap<u64, Mount>,
+    /// Quit was asked not to wait for uploads or cache status.
+    force_quit: bool,
     updates: Sender<Update>,
     activity_rx: Receiver<Update>,
 }
@@ -200,9 +214,20 @@ impl Worker {
     }
 
     fn request(&mut self, request: Request) {
-        if self.state.quitting && !matches!(request, Request::Quit | Request::CancelQuit) {
-            if let Request::Save(_, reply) = request {
-                let _ = reply.send(Err("Cancel quit before editing profiles.".into()));
+        if self.state.quitting
+            && !matches!(
+                request,
+                Request::Quit | Request::QuitNow | Request::CancelQuit
+            )
+        {
+            match request {
+                Request::Save(_, reply) => {
+                    let _ = reply.send(Err("Cancel quit before editing profiles.".into()));
+                }
+                Request::ClearCache(_, reply) => {
+                    let _ = reply.send(Err("Cancel quit before clearing a cache.".into()));
+                }
+                _ => {}
             }
             return;
         }
@@ -210,7 +235,7 @@ impl Worker {
         match request {
             Request::Refresh => self.refresh(),
             Request::Mount(id) => self.mount(id),
-            Request::Unmount(id) => self.unmount(id),
+            Request::Unmount(id) => self.unmount(id, true),
             Request::Save(mut profile, reply) => {
                 let result = (|| {
                     if self
@@ -274,9 +299,26 @@ impl Worker {
                     Err(e) => self.state.message = e,
                 }
             }
+            Request::ClearCache(id, reply) => {
+                let result = if self.mounts.contains_key(&id)
+                    || self.state.statuses.get(&id).is_some_and(Status::active)
+                {
+                    Err("Unmount this before clearing its cache.".into())
+                } else if !self.state.config.profiles.iter().any(|p| p.id == id) {
+                    Err("This mount was removed.".into())
+                } else {
+                    clear_cache(&self.paths.cache.join(id.to_string()))
+                };
+                let _ = reply.send(result);
+            }
             Request::Quit => self.state.quitting = true,
+            Request::QuitNow => {
+                self.state.quitting = true;
+                self.force_quit = true;
+            }
             Request::CancelQuit => {
                 self.state.quitting = false;
+                self.force_quit = false;
                 self.state.message =
                     "Quit cancelled. Unmounts already in progress will finish.".into();
             }
@@ -338,6 +380,8 @@ impl Worker {
                     child,
                     started: Instant::now(),
                     unmounting: false,
+                    unmount_started: None,
+                    terminated: false,
                     _monitor: control.watch(id, self.updates.clone()),
                     control,
                 },
@@ -354,7 +398,9 @@ impl Worker {
         );
     }
 
-    fn unmount(&mut self, id: u64) {
+    /// `check` refuses while uploads are pending or cache status is unknown. Without it, the
+    /// unmount is still a normal one; pending writes stay in the cache for the next mount.
+    fn unmount(&mut self, id: u64, check: bool) {
         let Some(profile) = self.state.config.profiles.iter().find(|p| p.id == id) else {
             return;
         };
@@ -368,6 +414,7 @@ impl Worker {
             }
             // Recovery can upload cached writes before FUSE is mounted. Check on cancellation too.
             match mount.control.activity() {
+                _ if !check => {}
                 Ok(activity) if activity.pending_uploads() => {
                     self.state.message = "Uploads are still pending. Wait for the upload queue to finish before unmounting or cancelling startup.".into();
                     return;
@@ -386,6 +433,8 @@ impl Worker {
                 {
                     Ok(status) if status.success() => {
                         mount.unmounting = true;
+                        mount.unmount_started = Some(Instant::now());
+                        mount.terminated = true;
                         self.state.statuses.insert(id, Status::Unmounting);
                     }
                     _ => {
@@ -403,13 +452,19 @@ impl Worker {
             match output {
                 Ok(output) if output.status.success() => {
                     mount.unmounting = true;
+                    mount.unmount_started = Some(Instant::now());
                     self.state.statuses.insert(id, Status::Unmounting);
                 }
                 Ok(output) => {
-                    self.state.message = format!(
-                        "Unmount failed (close open files and retry): {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    )
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    self.state.message = if stderr.contains("busy") {
+                        format!(
+                            "{} is in use. Close its open files and retry.",
+                            profile.name
+                        )
+                    } else {
+                        format!("Cannot unmount {}: {}", profile.name, stderr.trim())
+                    }
                 }
                 Err(e) => self.state.message = format!("Cannot run fusermount3: {e}"),
             }
@@ -438,6 +493,21 @@ impl Worker {
                 .iter()
                 .find(|p| p.id == id)
                 .unwrap();
+            // The folder is gone but rclone has not exited: ask it to, once. SIGTERM is
+            // graceful, so writes that have not uploaded stay in the cache.
+            if mount.unmounting
+                && !mount.terminated
+                && mount
+                    .unmount_started
+                    .is_some_and(|t| t.elapsed() > EXIT_GRACE)
+                && !is_mounted(&profile.mountpoint)
+                && matches!(mount.child.try_wait(), Ok(None))
+            {
+                mount.terminated = Command::new("kill")
+                    .args(["-TERM", "--", &mount.child.id().to_string()])
+                    .status()
+                    .is_ok_and(|status| status.success());
+            }
             let next = match mount.child.try_wait() {
                 Ok(Some(exit)) => {
                     finished.push(id);
@@ -495,42 +565,121 @@ impl Worker {
                 }
             }
         }
+        if !self.state.quitting {
+            self.force_quit = false;
+        }
         if self.state.quitting {
+            let force = self.force_quit;
             let ready: Vec<_> = self
                 .mounts
                 .iter()
                 .filter_map(|(&id, mount)| {
                     (!mount.unmounting
-                        && self.state.activity.get(&id).is_some_and(|sample| {
-                            sample.as_ref().is_ok_and(|activity| {
-                                activity.cache.is_ok() && !activity.pending_uploads()
-                            })
-                        }))
+                        && (force
+                            || self.state.activity.get(&id).is_some_and(|sample| {
+                                sample.as_ref().is_ok_and(|activity| {
+                                    activity.cache.is_ok() && !activity.pending_uploads()
+                                })
+                            })))
                     .then_some(id)
                 })
                 .collect();
             for id in ready {
                 // Recheck live RC data immediately before each normal unmount.
-                self.unmount(id);
+                self.unmount(id, !force);
                 if !self.mounts[&id].unmounting {
                     self.state.quitting = false;
+                    self.force_quit = false;
                     self.state.message = format!("Quit paused: {}", self.state.message);
                     return true;
                 }
                 changed = true;
             }
-            let message = if self.mounts.values().any(|mount| !mount.unmounting) {
-                "Waiting for uploads and cache checks before quitting…"
-            } else {
-                "Unmounting before quitting…"
+            let waiting = self.mounts.values().filter(|m| !m.unmounting).count();
+            let pending: usize = self
+                .mounts
+                .iter()
+                .filter(|(_, mount)| !mount.unmounting)
+                .filter_map(|(id, _)| self.state.activity.get(id)?.as_ref().ok())
+                .map(|activity| {
+                    activity.uploads.as_ref().map_or(0, Vec::len).max(
+                        activity
+                            .transfers
+                            .iter()
+                            .filter(|t| t.direction() == "Uploading")
+                            .count(),
+                    )
+                })
+                .sum();
+            let message = match (waiting, pending) {
+                (0, _) => "Unmounting before quitting…".to_string(),
+                (_, 0) => "Waiting for cache status before quitting…".to_string(),
+                (_, 1) => "Waiting for 1 upload before quitting…".to_string(),
+                (_, count) => format!("Waiting for {count} uploads before quitting…"),
             };
             if self.state.message != message {
-                self.state.message = message.into();
+                self.state.message = message;
                 changed = true;
             }
         }
         changed
     }
+}
+
+/// Bytes a profile's cache occupies on disk. Missing or unreadable entries count as zero.
+pub fn cache_usage(dir: &Path) -> u64 {
+    fn walk(path: &Path) -> u64 {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => fs::read_dir(path)
+                .map(|entries| entries.flatten().map(|e| walk(&e.path())).sum())
+                .unwrap_or(0),
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        }
+    }
+    walk(dir)
+}
+
+/// Cached writes that have not reached the remote exist nowhere else. rclone records them
+/// as `"Dirty": true` in `vfsMeta`; any such entry, or one that cannot be read, blocks clearing.
+pub fn clear_cache(dir: &Path) -> Result<u64, String> {
+    fn pending(path: &Path, dirty: &mut usize) -> Result<(), String> {
+        let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
+                pending(&entry.map_err(|e| e.to_string())?.path(), dirty)?;
+            }
+        } else if meta.is_file() {
+            let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|_| "Cannot read the cache's upload records.".to_string())?;
+            if value.get("Dirty").and_then(|d| d.as_bool()) != Some(false) {
+                *dirty += 1;
+            }
+        }
+        Ok(())
+    }
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let records = dir.join("vfsMeta");
+    if records.exists() {
+        let mut dirty = 0;
+        pending(&records, &mut dirty)?;
+        if dirty > 0 {
+            let files = if dirty == 1 {
+                "file hasn’t"
+            } else {
+                "files haven’t"
+            };
+            return Err(format!(
+                "{dirty} cached {files} uploaded yet. Mount it so uploads can finish, then clear the cache."
+            ));
+        }
+    }
+    let freed = cache_usage(dir);
+    fs::remove_dir_all(dir).map_err(|e| format!("Cannot clear cache: {e}"))?;
+    Ok(freed)
 }
 
 pub fn validate(profile: &Profile, remotes: &[String]) -> Result<(), String> {
@@ -686,11 +835,14 @@ mod tests {
                     child,
                     started: Instant::now(),
                     unmounting: false,
+                    unmount_started: None,
+                    terminated: false,
                     control,
                     _monitor: monitor,
                 },
             )]
             .into(),
+            force_quit: false,
             updates,
             activity_rx,
         };
@@ -769,7 +921,10 @@ mod tests {
         worker.request(Request::Quit);
         worker.poll();
         assert!(worker.state.quitting);
-        assert!(worker.state.message.contains("Waiting for uploads"));
+        assert_eq!(
+            worker.state.message,
+            "Waiting for cache status before quitting…"
+        );
         assert!(!worker.mounts[&41].unmounting);
         worker.request(Request::CancelQuit);
         assert!(!worker.state.quitting);
@@ -785,6 +940,85 @@ mod tests {
         assert!(!worker.mounts.contains_key(&41));
         assert!(!worker.state.quitting);
         assert!(worker.state.message.contains("Quit paused"));
+    }
+
+    #[test]
+    fn quit_now_stops_a_mount_whose_upload_status_never_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile {
+            id: 41,
+            name: "Stuck".into(),
+            remote: "test".into(),
+            folder: String::new(),
+            mountpoint: dir.path().join("not-mounted"),
+            cache_gib: 1,
+            mount_at_start: false,
+        };
+        let child = Command::new("sh")
+            .args(["-c", "while :; do sleep 0.05; done"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (updates, activity_rx) = mpsc::channel();
+        let (monitor, _) = mpsc::channel();
+        let mut worker = Worker {
+            paths: Paths {
+                config: dir.path().join("profiles.toml"),
+                cache: dir.path().join("cache"),
+                logs: dir.path().join("logs"),
+                autostart: dir.path().join("autostart.desktop"),
+            },
+            state: Snapshot {
+                config: Config {
+                    profiles: vec![profile],
+                },
+                remotes: vec!["test".into()],
+                statuses: [(41, Status::Recovering)].into(),
+                activity: [(41, Err("cache status unavailable".into()))].into(),
+                message: String::new(),
+                quitting: false,
+            },
+            mounts: [(
+                41,
+                Mount {
+                    child,
+                    started: Instant::now(),
+                    unmounting: false,
+                    unmount_started: None,
+                    terminated: false,
+                    control: Control::new().unwrap(),
+                    _monitor: monitor,
+                },
+            )]
+            .into(),
+            force_quit: false,
+            updates,
+            activity_rx,
+        };
+        // A plain Quit waits: nothing proves the uploads are done.
+        worker.request(Request::Quit);
+        worker.poll();
+        assert!(!worker.mounts[&41].unmounting);
+        assert_eq!(
+            worker.state.message,
+            "Waiting for cache status before quitting…"
+        );
+        // Quit now stops it gracefully instead of waiting forever.
+        worker.request(Request::QuitNow);
+        worker.poll();
+        assert!(worker.mounts.get(&41).is_none_or(|m| m.unmounting));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while worker.mounts.contains_key(&41) && Instant::now() < deadline {
+            worker.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(worker.mounts.is_empty());
+        assert_eq!(worker.state.statuses[&41], Status::Unmounted);
+        assert!(worker.state.quitting, "the worker loop now reports Quit");
+        // Cancelling clears the forced mode for the next attempt.
+        worker.request(Request::CancelQuit);
+        assert!(!worker.force_quit);
     }
 
     #[test]
@@ -1048,5 +1282,45 @@ mod tests {
         println!(
             "Verified persistence, authenticated RC, live download/upload progress, queued uploads, exact bytes, pending-upload protection, busy-mount quit refusal, cancel quit, automatic upload drain/unmount/exit, and retained cache/profiles."
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn record(dir: &Path, name: &str, dirty: &str) {
+        let meta = dir.join("vfsMeta/remote").join(name);
+        fs::create_dir_all(meta.parent().unwrap()).unwrap();
+        fs::write(meta, format!("{{\"Size\": 6, \"Dirty\": {dirty}}}")).unwrap();
+        let data = dir.join("vfs/remote").join(name);
+        fs::create_dir_all(data.parent().unwrap()).unwrap();
+        fs::write(data, "hello\n").unwrap();
+    }
+
+    #[test]
+    fn clearing_refuses_while_cached_writes_wait_for_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("41");
+        assert_eq!(clear_cache(&dir), Ok(0));
+        record(&dir, "done.txt", "false");
+        record(&dir, "nested/pending.txt", "true");
+        let refused = clear_cache(&dir).unwrap_err();
+        assert!(
+            refused.starts_with("1 cached file hasn’t uploaded yet"),
+            "{refused}"
+        );
+        assert!(dir.join("vfs/remote/nested/pending.txt").exists());
+        // A record that cannot be read is treated as possibly pending.
+        record(&dir, "nested/pending.txt", "false");
+        fs::write(dir.join("vfsMeta/remote/broken"), "{").unwrap();
+        assert!(clear_cache(&dir).is_err());
+        assert!(dir.exists());
+        fs::remove_file(dir.join("vfsMeta/remote/broken")).unwrap();
+        let used = cache_usage(&dir);
+        assert!(used >= 12);
+        assert_eq!(clear_cache(&dir), Ok(used));
+        assert!(!dir.exists());
+        assert_eq!(cache_usage(&dir), 0);
     }
 }

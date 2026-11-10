@@ -1,4 +1,4 @@
-//! What the window says about mounts, kept free of GTK so every state can be tested.
+//! What the window says about mounts, kept free of UI toolkits so every state can be tested.
 use crate::{
     backend::{Snapshot, Status},
     config::Profile,
@@ -16,16 +16,6 @@ pub enum Tone {
 }
 
 impl Tone {
-    pub fn css_class(self) -> &'static str {
-        match self {
-            Self::Idle => "rclone-idle",
-            Self::Ok => "rclone-ok",
-            Self::Busy => "rclone-busy",
-            Self::Warning => "rclone-warning",
-            Self::Danger => "rclone-danger",
-        }
-    }
-
     /// Text mark for surfaces without custom drawing, such as the tray menu.
     pub fn mark(self) -> &'static str {
         match self {
@@ -58,7 +48,18 @@ pub fn primary(status: &Status) -> Primary {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Overview {
     pub headline: String,
-    pub detail: String,
+    /// Separate facts. Each surface lays them out itself, so none is joined with punctuation here.
+    pub facts: Vec<String>,
+}
+
+impl Overview {
+    /// One line for text-only surfaces such as the tray tooltip.
+    pub fn summary(&self) -> String {
+        std::iter::once(self.headline.as_str())
+            .chain(self.facts.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 pub fn overview(state: &Snapshot) -> Overview {
@@ -71,7 +72,7 @@ pub fn overview(state: &Snapshot) -> Overview {
         .filter(|p| matches!(status(p.id), Status::Mounted | Status::External))
         .collect();
     let headline = match (mounted.len(), total) {
-        (_, 0) => "Rclone Tray".to_string(),
+        (_, 0) => "No mounts".to_string(),
         (1, 1) => "Mounted".to_string(),
         (0, 1) => "Not mounted".to_string(),
         (count, _) if count == total => format!("All {total} mounted"),
@@ -93,12 +94,14 @@ pub fn overview(state: &Snapshot) -> Overview {
         .filter(|p| status(p.id).active())
         .filter_map(|p| state.activity.get(&p.id)?.as_ref().ok())
         .collect();
-    let speed = rates_text(
+    let mut live = rates(
         samples.iter().map(|a| a.rates().upload).sum(),
         samples.iter().map(|a| a.rates().download).sum(),
         samples.iter().map(|a| a.rates().other).sum(),
     );
-    let queued = samples.iter().filter_map(|a| queued_uploads(a)).sum();
+    live.extend(queued_text(
+        samples.iter().filter_map(|a| queued_uploads(a)).sum(),
+    ));
     let owned = mounted.iter().any(|p| *status(p.id) == Status::Mounted);
     let unavailable = state
         .config
@@ -107,68 +110,76 @@ pub fn overview(state: &Snapshot) -> Overview {
         .filter(|p| status(p.id).active() && *status(p.id) != Status::External)
         .filter(|p| !matches!(state.activity.get(&p.id), Some(Ok(_))))
         .count();
-    let detail = if state.quitting {
-        "Quitting…".to_string()
+    let facts = if state.quitting {
+        vec!["Quitting…".to_string()]
     } else if attention > 0 {
         let verb = if attention == 1 { "needs" } else { "need" };
-        format!("{attention} {verb} attention")
-    } else if let Some(line) = join(speed, queued_text(queued)) {
-        match unavailable {
-            0 => line,
-            count => format!("{line} · {count} unavailable"),
+        vec![format!("{attention} {verb} attention")]
+    } else if !live.is_empty() {
+        if unavailable > 0 {
+            live.push(format!("{unavailable} unavailable"));
         }
+        live
     } else if unavailable > 0 {
-        "Activity unavailable".to_string()
+        vec!["Activity unavailable".to_string()]
     } else if owned {
-        "No uploads queued".to_string()
+        vec!["No uploads queued".to_string()]
     } else {
-        String::new()
+        vec![]
     };
-    Overview { headline, detail }
+    Overview { headline, facts }
 }
 
-/// Short ledger text: the state when quiet, the live numbers when transfers run.
-pub fn activity_line(status: &Status, sample: Option<&Result<Activity, String>>) -> (String, Tone) {
-    let label = status.label().to_string();
+/// The state when quiet, the live numbers when transfers run. Facts stay separate.
+pub fn activity_line(
+    status: &Status,
+    sample: Option<&Result<Activity, String>>,
+) -> (Vec<String>, Tone) {
+    let label = || vec![status.label().to_string()];
     match status {
-        Status::Unmounted => (label, Tone::Idle),
-        Status::Mounting | Status::Recovering | Status::Unmounting => (label, Tone::Busy),
-        Status::Waiting => (label, Tone::Warning),
-        Status::External => (label, Tone::Ok),
-        Status::Error(_) => (label, Tone::Danger),
+        Status::Unmounted => (label(), Tone::Idle),
+        Status::Mounting | Status::Recovering | Status::Unmounting => (label(), Tone::Busy),
+        Status::Waiting => (label(), Tone::Warning),
+        Status::External => (label(), Tone::Ok),
+        Status::Error(_) => (label(), Tone::Danger),
         Status::Mounted => match sample {
-            Some(Err(_)) => ("Activity unavailable".into(), Tone::Warning),
-            None => (label, Tone::Ok),
+            Some(Err(_)) => (vec!["Activity unavailable".into()], Tone::Warning),
+            None => (label(), Tone::Ok),
             Some(Ok(activity)) => {
                 if activity.cache.as_ref().is_ok_and(|c| c.out_of_space) {
-                    return ("Cache full".into(), Tone::Danger);
+                    return (vec!["Cache full".into()], Tone::Danger);
                 }
                 if activity.cache.as_ref().is_ok_and(|c| c.errored_files > 0) {
-                    return ("Upload needs retry".into(), Tone::Warning);
+                    return (vec!["Upload needs retry".into()], Tone::Warning);
                 }
-                let rates = activity.rates();
-                let speed = rates_text(rates.upload, rates.download, rates.other);
-                let queued = queued_text(queued_uploads(activity).unwrap_or(0));
-                (join(speed, queued).unwrap_or(label), Tone::Ok)
+                let r = activity.rates();
+                let mut facts = rates(r.upload, r.download, r.other);
+                facts.extend(queued_text(queued_uploads(activity).unwrap_or(0)));
+                if facts.is_empty() {
+                    (label(), Tone::Ok)
+                } else {
+                    (facts, Tone::Ok)
+                }
             }
         },
     }
 }
 
-/// The lamp and the row's button already say mounted or not. Text is for anything else.
-pub fn ledger_note<'a>(status: &Status, line: &'a str) -> &'a str {
-    if line == status.label() && matches!(status, Status::Mounted | Status::Unmounted) {
-        ""
+/// The switch already says mounted or not. Row text is for anything else.
+pub fn ledger_note(status: &Status, facts: Vec<String>) -> Vec<String> {
+    let plain = facts.len() == 1 && facts[0] == status.label();
+    if plain && matches!(status, Status::Mounted | Status::Unmounted) {
+        vec![]
     } else {
-        line
+        facts
     }
 }
 
 pub fn status_hint(status: &Status) -> Option<&str> {
     match status {
-        Status::Recovering => Some("Restoring cached uploads before the folder becomes available."),
-        Status::Waiting => Some("Startup has exceeded 30 seconds. The log has details."),
-        Status::External => Some("Managed by another session. Activity is unavailable."),
+        Status::Recovering => Some("Uploading cached files before the folder opens."),
+        Status::Waiting => Some("Startup is slow. The log shows why."),
+        Status::External => Some("Mounted by another session."),
         Status::Error(error) => Some(error),
         _ => None,
     }
@@ -178,9 +189,9 @@ pub fn status_hint(status: &Status) -> Option<&str> {
 pub fn cache_warning(sample: Option<&Result<Activity, String>>) -> Option<&'static str> {
     let cache = sample?.as_ref().ok()?.cache.as_ref().ok()?;
     if cache.out_of_space {
-        Some("The cache is full. Free disk space so uploads can continue.")
+        Some("Cache is full. Free disk space so uploads can continue.")
     } else if cache.errored_files > 0 {
-        Some("Some uploads failed and will retry. The log has details.")
+        Some("Some uploads failed and will retry.")
     } else {
         None
     }
@@ -218,54 +229,51 @@ pub fn short_path(path: &Path, home: Option<&Path>) -> String {
 
 pub fn remote_path(profile: &Profile) -> String {
     if profile.folder.is_empty() {
-        profile.remote.clone()
+        format!("{}:", profile.remote)
     } else {
         format!("{}:{}", profile.remote, profile.folder)
     }
 }
 
-pub fn detail_line(profile: &Profile, sample: Option<&Result<Activity, String>>) -> String {
+/// Live cache use while mounted, the measured size on disk otherwise.
+pub fn cache_line(
+    profile: &Profile,
+    sample: Option<&Result<Activity, String>>,
+    on_disk: Option<u64>,
+) -> String {
     let target = profile.cache_gib;
-    let cache = match sample.and_then(|s| s.as_ref().ok()).map(|a| &a.cache) {
-        Some(Ok(cache)) => format!(
-            "{} cached of {target} GiB target",
-            byte_size(cache.bytes_used as f64)
-        ),
-        _ => format!("{target} GiB cache target"),
+    let used = match sample.and_then(|s| s.as_ref().ok()).map(|a| &a.cache) {
+        Some(Ok(cache)) => Some(cache.bytes_used),
+        _ => on_disk,
     };
-    format!("{} · {cache}", remote_path(profile))
+    match used {
+        Some(bytes) => format!("{} of {target} GiB cache", byte_size(bytes as f64)),
+        None => format!("{target} GiB cache"),
+    }
 }
 
-fn rates_text(upload: f64, download: f64, other: f64) -> Option<String> {
-    let parts = [("↑", upload), ("↓", download), ("Other", other)]
+fn rates(upload: f64, download: f64, other: f64) -> Vec<String> {
+    [("↑", upload), ("↓", download), ("Other", other)]
         .into_iter()
         .filter(|(_, rate)| *rate > 0.0)
         .map(|(mark, rate)| format!("{mark} {}/s", byte_size(rate)))
-        .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join("  "))
+        .collect()
 }
 
 fn queued_text(count: u64) -> Option<String> {
     (count > 0).then(|| format!("{count} queued"))
 }
 
-fn join(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(format!("{first} · {second}")),
-        (first, second) => first.or(second),
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueueRow {
     pub name: String,
-    pub detail: String,
+    pub facts: Vec<String>,
     pub progress: f64,
 }
 
 #[derive(Debug, Default, PartialEq)]
 pub struct QueuePane {
-    pub notice: String,
+    pub facts: Vec<String>,
     pub hint: Option<String>,
     pub rows: Vec<QueueRow>,
 }
@@ -283,7 +291,7 @@ pub fn queues(snapshot: &Snapshot, id: u64) -> Queues {
     let unavailable = if profile.is_none() {
         Some("Mount removed")
     } else if *status == Status::External {
-        Some("Managed by another session")
+        Some("Mounted by another session")
     } else if !status.active() {
         Some("Not mounted")
     } else if *status == Status::Unmounting {
@@ -300,7 +308,7 @@ pub fn queues(snapshot: &Snapshot, id: u64) -> Queues {
                 "Loading…"
             });
             let pane = || QueuePane {
-                notice: message.into(),
+                facts: vec![message.into()],
                 ..QueuePane::default()
             };
             return Queues {
@@ -320,10 +328,13 @@ fn upload_pane(activity: &Activity) -> QueuePane {
     let mut waiting = Vec::new();
     let uploading = |t: &&Transfer| t.direction() == "Uploading";
     match &activity.uploads {
-        Ok(queue) if queue.is_empty() => pane.notice = "No queued uploads".into(),
+        Ok(queue) if queue.is_empty() => pane.facts = vec!["No queued uploads".into()],
         Ok(queue) => {
             let active = queue.iter().filter(|item| item.uploading).count();
-            pane.notice = format!("{active} uploading · {} queued", queue.len() - active);
+            pane.facts = vec![
+                format!("{active} uploading"),
+                format!("{} queued", queue.len() - active),
+            ];
             for item in queue {
                 if let Some(transfer) = activity
                     .transfers
@@ -334,26 +345,24 @@ fn upload_pane(activity: &Activity) -> QueuePane {
                     pane.rows.push(transfer_row(transfer));
                     continue;
                 }
-                let state = if item.uploading {
-                    "Uploading".into()
-                } else if item.expiry > 0.0 {
-                    format!("Queued, eligible in {:.0}s", item.expiry.ceil())
-                } else {
-                    "Queued, waiting for a slot".into()
-                };
-                let attempts = if item.tries > 0 {
-                    format!(" · {} attempts", item.tries)
-                } else {
-                    String::new()
-                };
-                let size = if item.size < 0 {
+                let mut facts = vec![if item.size < 0 {
                     "Size unknown".into()
                 } else {
                     byte_size(item.size as f64)
-                };
+                }];
+                facts.push(if item.uploading {
+                    "Uploading".into()
+                } else if item.expiry > 0.0 {
+                    format!("Starts in {:.0}s", item.expiry.ceil())
+                } else {
+                    "Waiting for a slot".into()
+                });
+                if item.tries > 0 {
+                    facts.push(format!("{} attempts", item.tries));
+                }
                 let row = QueueRow {
                     name: item.name.clone(),
-                    detail: format!("{size} · {state}{attempts}"),
+                    facts,
                     progress: 0.0,
                 };
                 if item.uploading {
@@ -364,7 +373,7 @@ fn upload_pane(activity: &Activity) -> QueuePane {
             }
         }
         Err(error) => {
-            pane.notice = "Upload queue unavailable".into();
+            pane.facts = vec!["Upload queue unavailable".into()];
             pane.hint = Some(error.clone());
         }
     }
@@ -395,17 +404,17 @@ fn download_pane(activity: &Activity) -> QueuePane {
         .iter()
         .filter(|t| t.direction() == "Transferring")
         .count();
-    let mut notice = if rows.is_empty() {
+    let mut facts = vec![if rows.is_empty() {
         "No active downloads".to_string()
     } else {
         format!("{} downloading", rows.len())
-    };
+    }];
     if unknown > 0 {
-        notice.push_str(&format!(" · {unknown} unclassified"));
+        facts.push(format!("{unknown} unclassified"));
     }
     QueuePane {
-        notice,
-        hint: Some("Downloads start when files are read. rclone has no waiting queue.".into()),
+        facts,
+        hint: None,
         rows,
     }
 }
@@ -422,7 +431,7 @@ fn transfer_row(transfer: &Transfer) -> QueueRow {
     };
     QueueRow {
         name: transfer.name.clone(),
-        detail: format!("{amount} · {}/s", byte_size(transfer.speed_avg)),
+        facts: vec![amount, format!("{}/s", byte_size(transfer.speed_avg))],
         progress: if transfer.size > 0 {
             (transfer.bytes as f64 / transfer.size as f64).clamp(0.0, 1.0)
         } else {
@@ -509,13 +518,18 @@ mod tests {
     fn overview_counts_mounts_and_never_claims_an_empty_queue_without_telemetry() {
         let mut state = snapshot(&[Status::Mounted, Status::Mounted, Status::Unmounted]);
         assert_eq!(overview(&state).headline, "2 of 3 mounted");
-        assert_eq!(overview(&state).detail, "Activity unavailable");
+        assert_eq!(overview(&state).facts, ["Activity unavailable"]);
         state.activity.insert(1, Ok(idle()));
         state.activity.insert(2, Ok(idle()));
-        assert_eq!(overview(&state).detail, "No uploads queued");
+        assert_eq!(overview(&state).facts, ["No uploads queued"]);
         state.statuses.insert(3, Status::Error("failed".into()));
-        assert_eq!(overview(&state).detail, "1 needs attention");
-        assert_eq!(overview(&snapshot(&[])).headline, "Rclone Tray");
+        assert_eq!(overview(&state).facts, ["1 needs attention"]);
+        assert_eq!(
+            overview(&state).summary(),
+            "2 of 3 mounted, 1 needs attention"
+        );
+        assert_eq!(overview(&snapshot(&[])).headline, "No mounts");
+        assert!(overview(&snapshot(&[])).facts.is_empty());
         assert_eq!(overview(&snapshot(&[Status::Mounted])).headline, "Mounted");
         let all = snapshot(&[Status::Mounted, Status::External]);
         assert_eq!(overview(&all).headline, "All 2 mounted");
@@ -530,9 +544,9 @@ mod tests {
         second.uploads = Ok(vec![queued("a"), queued("b")]);
         state.activity.insert(1, Ok(first));
         state.activity.insert(2, Ok(second));
-        assert_eq!(overview(&state).detail, "↑ 2.0 KiB/s · 2 queued");
+        assert_eq!(overview(&state).facts, ["↑ 2.0 KiB/s", "2 queued"]);
         state.quitting = true;
-        assert_eq!(overview(&state).detail, "Quitting…");
+        assert_eq!(overview(&state).facts, ["Quitting…"]);
     }
 
     #[test]
@@ -540,13 +554,13 @@ mod tests {
         let quiet = Ok(idle());
         assert_eq!(
             activity_line(&Status::Mounted, Some(&quiet)),
-            ("Mounted".into(), Tone::Ok)
+            (vec!["Mounted".to_string()], Tone::Ok)
         );
         let mut busy = idle();
         busy.transfers = vec![transfer(4096, 1024)];
         assert_eq!(
             activity_line(&Status::Mounted, Some(&Ok(busy))).0,
-            "↑ 2.0 KiB/s"
+            ["↑ 2.0 KiB/s"]
         );
         let mut full = idle();
         full.cache = Ok(Cache {
@@ -555,7 +569,7 @@ mod tests {
         });
         assert_eq!(
             activity_line(&Status::Mounted, Some(&Ok(full))),
-            ("Cache full".into(), Tone::Danger)
+            (vec!["Cache full".to_string()], Tone::Danger)
         );
         assert_eq!(
             activity_line(&Status::Mounted, Some(&Err("down".into()))).1,
@@ -565,11 +579,12 @@ mod tests {
 
     #[test]
     fn ledger_note_omits_only_the_plain_default_states() {
-        assert_eq!(ledger_note(&Status::Mounted, "Mounted"), "");
-        assert_eq!(ledger_note(&Status::Unmounted, "Unmounted"), "");
-        assert_eq!(ledger_note(&Status::Mounted, "Cache full"), "Cache full");
-        let label = Status::External.label().to_string();
-        assert_eq!(ledger_note(&Status::External, &label), label);
+        let note = |status: &Status, text: &str| ledger_note(status, vec![text.to_string()]);
+        assert!(note(&Status::Mounted, "Mounted").is_empty());
+        assert!(note(&Status::Unmounted, "Unmounted").is_empty());
+        assert_eq!(note(&Status::Mounted, "Cache full"), ["Cache full"]);
+        let label = Status::External.label();
+        assert_eq!(note(&Status::External, label), [label]);
     }
 
     #[test]
@@ -596,16 +611,19 @@ mod tests {
     }
 
     #[test]
-    fn detail_line_names_the_remote_and_cache_without_inventing_usage() {
+    fn detail_names_the_remote_and_cache_without_inventing_usage() {
         let mut mount = profile(1);
+        assert_eq!(remote_path(&mount), "work:");
         mount.folder = "Reports".into();
+        assert_eq!(remote_path(&mount), "work:Reports");
+        assert_eq!(cache_line(&mount, None, None), "10 GiB cache");
         assert_eq!(
-            detail_line(&mount, None),
-            "work:Reports · 10 GiB cache target"
+            cache_line(&mount, None, Some(3 << 20)),
+            "3.0 MiB of 10 GiB cache"
         );
         assert_eq!(
-            detail_line(&mount, Some(&Ok(idle()))),
-            "work:Reports · 0 B cached of 10 GiB target"
+            cache_line(&mount, Some(&Ok(idle())), Some(3 << 20)),
+            "0 B of 10 GiB cache"
         );
     }
 
@@ -627,27 +645,32 @@ mod tests {
     #[test]
     fn queues_distinguish_unavailable_from_empty_and_keep_startup_uploads() {
         let mut state = snapshot(&[Status::Mounted]);
-        assert_eq!(queues(&state, 1).uploads.notice, "Loading…");
+        assert_eq!(queues(&state, 1).uploads.facts, ["Loading…"]);
         state.activity.insert(1, Err("down".into()));
         assert_eq!(
-            queues(&state, 1).uploads.notice,
-            "Queue unavailable, reconnecting…"
+            queues(&state, 1).uploads.facts,
+            ["Queue unavailable, reconnecting…"]
         );
         state.activity.insert(1, Ok(idle()));
-        assert_eq!(queues(&state, 1).uploads.notice, "No queued uploads");
+        assert_eq!(queues(&state, 1).uploads.facts, ["No queued uploads"]);
+        assert_eq!(queues(&state, 1).downloads.facts, ["No active downloads"]);
         let mut starting = idle();
         starting.uploads = Err("VFS starting".into());
         starting.transfers = vec![transfer(1000, 500)];
         state.activity.insert(1, Ok(starting));
         let pane = queues(&state, 1).uploads;
-        assert_eq!(pane.notice, "Upload queue unavailable");
+        assert_eq!(pane.facts, ["Upload queue unavailable"]);
+        assert_eq!(pane.rows[0].facts, ["500 B of 1000 B", "2.0 KiB/s"]);
         assert_eq!(pane.rows.len(), 1);
         assert_eq!(pane.rows[0].progress, 0.5);
-        assert_eq!(queues(&state, 9).uploads.notice, "Mount removed");
+        assert_eq!(queues(&state, 9).uploads.facts, ["Mount removed"]);
         let mut mixed = idle();
         mixed.uploads = Ok(vec![queued("waiting"), queued("report.pdf")]);
         mixed.transfers = vec![transfer(1000, 500)];
         state.activity.insert(1, Ok(mixed));
-        assert_eq!(queues(&state, 1).uploads.rows[0].name, "report.pdf");
+        let pane = queues(&state, 1).uploads;
+        assert_eq!(pane.facts, ["0 uploading", "2 queued"]);
+        assert_eq!(pane.rows[0].name, "report.pdf");
+        assert_eq!(pane.rows[1].facts, ["1.0 KiB", "Waiting for a slot"]);
     }
 }

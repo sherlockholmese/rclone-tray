@@ -1,13 +1,17 @@
 pkgname=rclone-tray
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Native GTK tray application for mounting configured rclone remotes'
+pkgdesc='Tray application for mounting configured rclone remotes, with a GPUI settings window'
 arch=('x86_64' 'aarch64')
 # No project license has been chosen. This recipe is for local builds only.
 license=('LicenseRef-Unknown')
-depends=('gtk4' 'rclone' 'fuse3' 'util-linux')
+# The settings window is GPUI: it links xcb/xkbcommon and loads Wayland, Vulkan, and
+# fontconfig at runtime. glib2 provides gio for notifications and opening folders.
+depends=('glib2' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'vulkan-icd-loader'
+         'fontconfig' 'rclone' 'fuse3' 'util-linux')
 makedepends=('cargo' 'pkgconf' 'desktop-file-utils')
-optdepends=('gnome-shell-extension-appindicator: tray support on GNOME')
+optdepends=('gnome-shell-extension-appindicator: tray support on GNOME'
+            'vulkan-driver: GPU rendering for the settings window')
 source=("$pkgname-$pkgver.tar.gz")
 # build.sh appends the checksum of the current local source snapshot.
 
