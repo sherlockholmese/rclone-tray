@@ -1,11 +1,12 @@
 # Rclone Tray
 
-A native Rust/GTK4 Linux tray application for mounting existing rclone remotes as local folders.
+A native Rust Linux tray application for mounting existing rclone remotes as local folders.
 This is an initial MVP, not an offline-sync or conflict-resolution engine.
 
 ## Requirements
 
-- Rust 1.92 or newer and GTK4 development libraries (GTK 4.0+).
+- Rust 1.92 or newer, GLib/GIO, and the libraries GPUI needs: xcb, xkbcommon, Wayland,
+  fontconfig, and a Vulkan driver.
 - `rclone`, FUSE3 (`fusermount3`), and permission to access `/dev/fuse`.
 - A graphical Linux session with D-Bus. A StatusNotifierItem tray host is recommended
   (for example KDE's tray, Waybar's tray module, or GNOME's AppIndicator extension).
@@ -13,8 +14,8 @@ This is an initial MVP, not an offline-sync or conflict-resolution engine.
 - `kill` from the usual Linux process utilities, used only for graceful cancellation
   of a mount that has not become ready.
 
-On Arch Linux: `sudo pacman -S rust gtk4 rclone fuse3 pkgconf`.
-On Debian/Ubuntu: install `libgtk-4-dev rclone fuse3 pkg-config build-essential`
+On Arch Linux: `sudo pacman -S rust glib2 libxkbcommon-x11 wayland vulkan-icd-loader fontconfig rclone fuse3 pkgconf`.
+On Debian/Ubuntu: install `libglib2.0-dev libxkbcommon-x11-dev libwayland-dev libvulkan1 libfontconfig-dev rclone fuse3 pkg-config build-essential`
 and a sufficiently recent Rust toolchain through rustup.
 
 ## Run
@@ -27,19 +28,22 @@ cargo run
 cargo run -- --background
 ```
 
-Click **+** (Ctrl+N), choose a configured remote, optionally enter a remote subfolder,
+Click **Add mount** (Ctrl+N), choose a configured remote, optionally enter a remote subfolder,
 and choose an absolute empty local directory. A missing directory is created on mount.
 The tray menu and main window both offer mount, open folder, log, and unmount actions.
 Re-launching the application opens the existing instance rather than starting duplicate mounts.
 
-The main window is one list of mounts. A filled dot means mounted, a ring means unmounted, a
-spinner means working, and a warning sign means something needs you. Live speeds, queued uploads,
-and problems appear on the row only when there is something to report, and the line under a row
+The settings window is built with GPUI and shadcn-style components (gpui-component), and
+follows the desktop's light or dark appearance. It is one list of mounts. Each row's switch
+mounts or unmounts it, the folder button opens it, and the row opens its details. A spinner
+means working, and a warning sign means something needs you. Live speeds, queued uploads, and
+problems appear on the row only when there is something to report, and the row's lower edge
 fills with the progress of its active transfers. The header sums up every mount. Unknown file
 sizes are left out of that line rather than estimated.
 
-Select a mount for its details: unmount, edit, remove, and **Uploads**, **Downloads**, and
-**Log** tabs. Queues list file names, transferred bytes, speeds, and progress when the size is
+Select a mount for its details: the same switch, **Open folder**, **Clear cache**, **Edit**,
+**Remove**, and **Uploads**, **Downloads**, and **Log** tabs. Clearing, editing, and removing
+need the mount to be unmounted first. Queues list file names, transferred bytes, speeds, and progress when the size is
 known, with moving files first. Waiting uploads show their size, delay, and retry attempts.
 Escape or Alt+Left returns to the list. **Refresh remotes** (F5), **Start at login**, and
 **Quit…** (Ctrl+Q) are in the window menu. Downloads are on demand: rclone exposes active downloads, not a waiting download
@@ -101,7 +105,9 @@ are pending, cached files need retry, or transfer/cache status cannot be checked
 also applies to cancelling startup: uploads can already be running before the mount exists.
 Do not force-stop a recovering process just because the folder is not mounted yet. An open file
 can still acquire new writes after the check; this is not a filesystem-wide flush guarantee.
-The app uses normal `fusermount3 -u`, not forced/lazy unmount, and does not delete cache data.
+The app uses normal `fusermount3 -u`, not forced/lazy unmount, and deletes cache data only
+when you choose **Clear cache**. Clearing works only while the mount is unmounted, and is refused
+while rclone's cache records (`vfsMeta`) mark any file as not yet uploaded, or cannot be read.
 Remounting the same unchanged profile lets rclone recover its cached writes. Do not change
 a profile's remote or folder while cached writes may be pending, and do not use external
 cache cleaners on pending data. Cache retention is not a backup guarantee.
@@ -113,16 +119,21 @@ The app cannot inspect transfer activity for mounts left by another session. If 
 unavailable indefinitely, inspect the original rclone process and logs before manually
 unmounting in a terminal.
 
-The tray/backend (`rclone-tray`) does not load GTK. It owns mounts, telemetry, and
-notifications. Settings and queue windows run in a separate, on-demand `rclone-tray-ui`
-process, communicating over a user-private Unix socket. Closing the main window exits
-that GTK process and frees its memory; mounts and tray status continue running.
+The tray/backend (`rclone-tray`) does not load a UI toolkit. It owns mounts, telemetry, and
+notifications. The settings window runs in a separate, on-demand `rclone-tray-ui` GPUI
+process, communicating over a user-private Unix socket. Closing the window exits that
+process and frees its memory; mounts and tray status continue running. A second launch
+hands its request to the open window instead of opening another.
 Reopening settings reconnects to the same backend without remounting.
 Per-mount rclone processes and their VFS caches still use additional memory.
 
 **Quit** waits for pending uploads
 and available cache status, normally unmounts each profile owned by this session, waits
-for its rclone process to exit, then closes the app. **Cancel quit** stops waiting without
+for its rclone process to exit, then closes the app. While it waits, the window and tray
+say what it is waiting for and offer **Quit now**, which unmounts without waiting. Writes
+that have not uploaded stay in the cache and resume the next time the unchanged profile
+mounts. If rclone keeps running 20 seconds after its folder is unmounted, it is asked to
+exit (SIGTERM, never SIGKILL). **Cancel quit** stops waiting without
 reversing unmounts already in progress. Busy mounts or cleanup failures pause Quit so you
 can close open files and retry. Profiles, logs, and cached data are retained; externally
 managed mounts are left alone. Unexpected application termination or desktop logout can
@@ -197,8 +208,7 @@ dbus-run-session -- env -u DISPLAY -u WAYLAND_DISPLAY RCLONE_TRAY_TEST_BUS=1 \
   cargo test native_notification_delivery_and_click -- --ignored --nocapture
 ```
 
-For GTK Vulkan swapchain/presentation warnings, a one-run renderer diagnostic is
-`GSK_RENDERER=gl cargo run`. The app does not change your renderer or system theme settings.
+The app does not change your renderer or system theme settings.
 Desktop behavior and appearance need validation in your own session.
 
 Upcoming work: richer recovery. Provider login remains

@@ -128,6 +128,9 @@ fn main() -> glib::ExitCode {
                     Action::Mount(id) => {
                         let _ = requests.send(Request::Mount(id));
                     }
+                    Action::QuitNow => {
+                        let _ = requests.send(Request::QuitNow);
+                    }
                     Action::Open(id) => {
                         if let Some(profile) = state
                             .lock()

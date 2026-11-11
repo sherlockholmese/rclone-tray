@@ -9,7 +9,17 @@ pub struct Profile {
     pub folder: String,
     pub mountpoint: PathBuf,
     pub cache_gib: u32,
+    #[serde(default = "default_threads")]
+    pub upload_threads: u32,
+    #[serde(default = "default_threads")]
+    pub download_threads: u32,
     pub mount_at_start: bool,
+}
+
+/// rclone's own default for `--transfers` and `--multi-thread-streams`. Used for profiles saved
+/// before these fields existed, and as the starting value for a new mount.
+pub fn default_threads() -> u32 {
+    4
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -106,6 +116,8 @@ mod tests {
             folder: "Reports/2026".into(),
             mountpoint: dir.path().join("mount with spaces"),
             cache_gib: 12,
+            upload_threads: 4,
+            download_threads: 4,
             mount_at_start: true,
         };
         paths
@@ -116,6 +128,11 @@ mod tests {
         let loaded = paths.load().unwrap();
         assert_eq!(loaded.profiles[0].folder, "Reports/2026");
         assert_eq!(loaded.profiles[0].cache_gib, 12);
+        let legacy = "[[profiles]]\nid = 1\nname = \"Old\"\nremote = \"r\"\nfolder = \"\"\nmountpoint = \"/tmp/x\"\ncache_gib = 5\nmount_at_start = false\n";
+        fs::write(&paths.config, legacy).unwrap();
+        let loaded = paths.load().unwrap();
+        assert_eq!(loaded.profiles[0].upload_threads, default_threads());
+        assert_eq!(loaded.profiles[0].download_threads, default_threads());
         fs::write(&paths.config, "[broken").unwrap();
         assert!(paths.load().is_err());
         assert_eq!(fs::read_to_string(paths.config).unwrap(), "[broken");

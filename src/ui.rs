@@ -1,1336 +1,1591 @@
-use crate::{
-    backend::{self, Event, Request, Snapshot, Status},
-    config::{Paths, Profile},
-    control::Activity,
-    ipc,
-    style::{self, FIELD_GAP, GAP, GROUP_GAP, INSET, ROW_GAP},
-    tray::Action,
-    view::{self, Primary, QueueRow, Tone},
+//! The settings window: one ledger of mounts, and a detail page per mount.
+use crate::{editor::Editor, style};
+use gio::prelude::*;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
+    ThemeMode, TitleBar, WindowExt as _,
+    button::{Button, ButtonVariants as _},
+    dialog::{DialogButtonProps, DialogFooter},
+    h_flex,
+    menu::{DropdownMenu as _, PopupMenuItem},
+    notification::Notification,
+    scroll::{ScrollableElement as _, ScrollbarMode},
+    spinner::Spinner,
+    switch::Switch,
+    tab::{Tab, TabBar},
+    v_flex,
 };
-use gtk::{gio, glib, prelude::*};
+use gpui_kit::{prelude::*, *};
+use rclone_tray::{
+    backend::{self, Event, Request, Snapshot, Status},
+    config::{Config, Paths, Profile},
+    control::byte_size,
+    ipc::{self, InstanceGuard},
+    tray::Action,
+    view::{self, Primary, Tone},
+};
 use std::{
-    cell::{Cell, RefCell},
     collections::HashMap,
     path::PathBuf,
     rc::Rc,
-    sync::mpsc,
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
     time::Duration,
 };
 
-const LIST_PAGE: &str = "list";
-const DETAIL_PAGE: &str = "detail";
-const UPLOADS: &str = "uploads";
-const DOWNLOADS: &str = "downloads";
-const LOG: &str = "log";
-// Bounds natural width, so long prose wraps instead of asking the window to grow.
-const MEASURE: i32 = 60;
+pub const CONTEXT: &str = "RcloneTray";
+gpui_kit::actions!(rclone_tray, [AddMount, Refresh, Quit, Back]);
 
-type Sample = Result<Activity, String>;
-
-fn label(text: &str, classes: &[&str]) -> gtk::Label {
-    let label = gtk::Label::new(Some(text));
-    label.set_xalign(0.0);
-    for class in classes {
-        label.add_css_class(class);
-    }
-    label
+enum Link {
+    Connected(Sender<Request>, Receiver<Event>),
+    /// `error` is shown only after a start attempt fails; a stopped backend is the usual case.
+    Offline {
+        error: Option<String>,
+        starting: bool,
+    },
 }
 
-fn wrapped(classes: &[&str]) -> gtk::Label {
-    let label = label("", classes);
-    label.set_wrap(true);
-    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    label.set_max_width_chars(MEASURE);
-    selectable(&label);
-    label.set_visible(false);
-    label
+/// The window's appearance. Kept beside the profiles so it survives restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemeChoice {
+    System,
+    Light,
+    Dark,
 }
 
-/// Copyable by pointer without becoming a Tab stop that selects itself on focus.
-fn selectable(label: &gtk::Label) {
-    label.set_selectable(true);
-    label.set_focusable(false);
-}
+impl ThemeChoice {
+    const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
 
-fn set_tone(widget: &impl IsA<gtk::Widget>, tone: Tone) {
-    for other in [
-        Tone::Idle,
-        Tone::Ok,
-        Tone::Busy,
-        Tone::Warning,
-        Tone::Danger,
-    ] {
-        widget.remove_css_class(other.css_class());
-    }
-    widget.add_css_class(tone.css_class());
-}
-
-fn seam() -> gtk::ProgressBar {
-    let bar = gtk::ProgressBar::new();
-    bar.add_css_class("rclone-seam");
-    bar
-}
-
-/// A state mark that differs by shape, so color is never the only signal.
-struct Lamp {
-    root: gtk::Box,
-    dot: gtk::Box,
-    spinner: gtk::Spinner,
-    icon: gtk::Image,
-}
-
-impl Lamp {
-    fn new() -> Self {
-        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        root.set_size_request(16, 16);
-        root.set_hexpand(false);
-        root.set_valign(gtk::Align::Center);
-        root.set_halign(gtk::Align::Center);
-        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        dot.add_css_class("rclone-dot");
-        dot.set_halign(gtk::Align::Center);
-        dot.set_valign(gtk::Align::Center);
-        dot.set_hexpand(true);
-        let spinner = gtk::Spinner::new();
-        spinner.set_hexpand(true);
-        let icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
-        icon.set_pixel_size(16);
-        root.append(&dot);
-        root.append(&spinner);
-        root.append(&icon);
-        Self {
-            root,
-            dot,
-            spinner,
-            icon,
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "System theme",
+            Self::Light => "Light theme",
+            Self::Dark => "Dark theme",
         }
     }
 
-    fn set(&self, tone: Tone) {
-        self.dot.set_visible(matches!(tone, Tone::Ok | Tone::Idle));
-        self.spinner.set_visible(tone == Tone::Busy);
-        self.spinner.set_spinning(tone == Tone::Busy);
-        self.icon
-            .set_visible(matches!(tone, Tone::Warning | Tone::Danger));
-        set_tone(&self.dot, tone);
-        set_tone(&self.icon, tone);
-    }
-}
-
-struct MountRow {
-    root: gtk::ListBoxRow,
-    profile: Profile,
-    status: Rc<RefCell<Status>>,
-    lamp: Lamp,
-    state: gtk::Label,
-    path: gtk::Label,
-    action: gtk::Button,
-    progress: gtk::ProgressBar,
-}
-
-impl MountRow {
-    fn new(
-        profile: &Profile,
-        status: &Status,
-        actions: &mpsc::Sender<Action>,
-        widths: &gtk::SizeGroup,
-    ) -> Self {
-        let id = profile.id;
-        let line = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
-        style::inset(&line, ROW_GAP, INSET);
-        let lamp = Lamp::new();
-        line.append(&lamp.root);
-        let identity = gtk::Box::new(gtk::Orientation::Vertical, FIELD_GAP);
-        identity.set_hexpand(true);
-        identity.set_valign(gtk::Align::Center);
-        let name = label(&profile.name, &["rclone-name"]);
-        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        name.set_tooltip_text(Some(&profile.name));
-        identity.append(&name);
-        let path = label("", &["rclone-muted"]);
-        path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        path.set_tooltip_text(Some(&profile.mountpoint.to_string_lossy()));
-        identity.append(&path);
-        line.append(&identity);
-        let state = label("", &["rclone-numeric"]);
-        state.set_xalign(1.0);
-        state.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        state.set_valign(gtk::Align::Center);
-        line.append(&state);
-        let current = Rc::new(RefCell::new(status.clone()));
-        let action = gtk::Button::new();
-        action.set_valign(gtk::Align::Center);
-        widths.add_widget(&action);
-        let live = current.clone();
-        let tx = actions.clone();
-        action.connect_clicked(move |_| {
-            let _ = tx.send(match view::primary(&live.borrow()) {
-                Primary::Open | Primary::Unavailable => Action::Open(id),
-                Primary::Mount => Action::Mount(id),
-                Primary::Cancel => Action::Unmount(id),
-            });
-        });
-        line.append(&action);
-        let chevron = gtk::Image::from_icon_name("go-next-symbolic");
-        chevron.add_css_class("rclone-muted");
-        line.append(&chevron);
-        let progress = seam();
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        body.append(&line);
-        body.append(&progress);
-        let root = gtk::ListBoxRow::new();
-        root.set_child(Some(&body));
-        root.set_action_name(Some("win.details"));
-        root.set_action_target_value(Some(&id.to_variant()));
-        Self {
-            root,
-            profile: profile.clone(),
-            status: current,
-            lamp,
-            state,
-            path,
-            action,
-            progress,
+    fn key(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
         }
     }
 
-    fn update(&self, status: &Status, sample: Option<&Sample>, home: Option<&std::path::Path>) {
-        *self.status.borrow_mut() = status.clone();
-        let (text, tone) = view::activity_line(status, sample);
-        self.lamp.set(tone);
-        self.lamp.root.set_tooltip_text(Some(&text));
-        let note = view::ledger_note(status, &text);
-        self.state.set_text(note);
-        self.state.set_visible(!note.is_empty());
-        set_tone(&self.state, tone);
-        self.state.set_tooltip_text(view::status_hint(status));
-        let path = view::short_path(&self.profile.mountpoint, home);
-        self.path.set_text(&path);
-        if *status == Status::Unmounted {
-            self.root.add_css_class("rclone-unmounted");
-        } else {
-            self.root.remove_css_class("rclone-unmounted");
-        }
-        let primary = view::primary(status);
-        self.action.set_label(match primary {
-            Primary::Open | Primary::Unavailable => "Open",
-            Primary::Mount => "Mount",
-            Primary::Cancel => "Cancel…",
-        });
-        self.action.set_sensitive(primary != Primary::Unavailable);
-        self.action.set_tooltip_text(Some(match primary {
-            Primary::Open | Primary::Unavailable => "Open folder",
-            Primary::Mount => "Mount",
-            Primary::Cancel => "Cancel mount",
-        }));
-        self.progress
-            .set_fraction(view::progress(status, sample).unwrap_or(0.0));
-    }
-}
-
-struct QueuePane {
-    page: gtk::StackPage,
-    title: &'static str,
-    model: gio::ListStore,
-    heading: gtk::Box,
-    scroll: gtk::ScrolledWindow,
-    notice: gtk::Label,
-    hint: gtk::Label,
-}
-
-impl QueuePane {
-    fn new(panes: &gtk::Stack, id: &str, title: &'static str) -> Self {
-        let model = gio::ListStore::new::<glib::BoxedAnyObject>();
-        let factory = gtk::SignalListItemFactory::new();
-        factory.connect_setup(|_, item| {
-            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-            let text = gtk::Box::new(gtk::Orientation::Vertical, FIELD_GAP);
-            style::inset(&text, GAP, INSET);
-            let name = label("", &[]);
-            name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            text.append(&name);
-            let detail = label("", &["rclone-muted", "rclone-numeric"]);
-            detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            text.append(&detail);
-            let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            row.append(&text);
-            row.append(&seam());
-            item.set_child(Some(&row));
-        });
-        factory.connect_bind(|_, item| {
-            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-            let object = item
-                .item()
-                .and_downcast::<glib::BoxedAnyObject>()
-                .expect("queue rows hold QueueRow");
-            let row = object.borrow::<QueueRow>();
-            let container = item.child().unwrap();
-            let text = container.first_child().unwrap();
-            let name = text.first_child().and_downcast::<gtk::Label>().unwrap();
-            let detail = name.next_sibling().and_downcast::<gtk::Label>().unwrap();
-            let bar = text
-                .next_sibling()
-                .and_downcast::<gtk::ProgressBar>()
-                .unwrap();
-            name.set_text(&row.name);
-            name.set_tooltip_text(Some(&row.name));
-            detail.set_text(&row.detail);
-            bar.set_fraction(row.progress);
-        });
-        let list = gtk::ListView::new(
-            Some(gtk::NoSelection::new(Some(model.clone()))),
-            Some(factory),
-        );
-        list.add_css_class("rclone-ledger");
-        let scroll = gtk::ScrolledWindow::builder()
-            .vexpand(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .child(&list)
-            .build();
-        let heading = gtk::Box::new(gtk::Orientation::Vertical, FIELD_GAP);
-        style::inset(&heading, ROW_GAP, INSET);
-        let notice = label("", &["rclone-numeric"]);
-        notice.set_wrap(true);
-        heading.append(&notice);
-        let hint = wrapped(&["rclone-muted"]);
-        heading.append(&hint);
-        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        page.append(&heading);
-        page.append(&scroll);
-        page.set_vexpand(true);
-        Self {
-            page: panes.add_titled(&page, Some(id), title),
-            title,
-            model,
-            heading,
-            scroll,
-            notice,
-            hint,
-        }
+    fn parse(text: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|choice| choice.key() == text.trim())
+            .unwrap_or(Self::System)
     }
 
-    fn update(&self, pane: &view::QueuePane) {
-        self.notice.set_text(&pane.notice);
-        self.hint.set_text(pane.hint.as_deref().unwrap_or(""));
-        self.hint.set_visible(pane.hint.is_some());
-        // With nothing to list, the message is the pane's content, not a caption.
-        let empty = pane.rows.is_empty();
-        self.scroll.set_visible(!empty);
-        self.heading.set_vexpand(empty);
-        self.heading.set_valign(if empty {
-            gtk::Align::Center
-        } else {
-            gtk::Align::Fill
-        });
-        for text in [&self.notice, &self.hint] {
-            text.set_halign(if empty {
-                gtk::Align::Center
-            } else {
-                gtk::Align::Start
-            });
-            text.set_xalign(if empty { 0.5 } else { 0.0 });
-            text.set_justify(if empty {
-                gtk::Justification::Center
-            } else {
-                gtk::Justification::Left
-            });
-        }
-        let title = match pane.rows.len() {
-            0 => self.title.to_string(),
-            count => format!("{} ({count})", self.title),
-        };
-        if self.page.title().as_deref() != Some(title.as_str()) {
-            self.page.set_title(&title);
-        }
-        set_queue_rows(&self.model, &pane.rows);
-    }
-}
-
-struct Detail {
-    id: Rc<Cell<Option<u64>>>,
-    status: Rc<RefCell<Status>>,
-    title: gtk::Label,
-    subtitle: gtk::Label,
-    problem: gtk::Label,
-    folder: gtk::Label,
-    meta: gtk::Label,
-    open: gtk::Button,
-    mount: gtk::Button,
-    unmount: gtk::Button,
-    edit: gtk::Button,
-    remove: gtk::Button,
-    panes: gtk::Stack,
-    uploads: QueuePane,
-    downloads: QueuePane,
-    log: gtk::TextView,
-    root: gtk::Box,
-}
-
-impl Detail {
-    fn new(actions: &mpsc::Sender<Action>) -> Self {
-        let id = Rc::new(Cell::new(None::<u64>));
-        let status = Rc::new(RefCell::new(Status::Unmounted));
-        let summary = gtk::Box::new(gtk::Orientation::Vertical, GROUP_GAP);
-        style::inset(&summary, GROUP_GAP, INSET);
-        let problem = wrapped(&[]);
-        summary.append(&problem);
-        let lead = gtk::Box::new(gtk::Orientation::Horizontal, GROUP_GAP);
-        let identity = gtk::Box::new(gtk::Orientation::Vertical, FIELD_GAP);
-        identity.set_hexpand(true);
-        identity.set_valign(gtk::Align::Center);
-        let folder = label("", &["rclone-headline"]);
-        folder.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        selectable(&folder);
-        identity.append(&folder);
-        let meta = label("", &["rclone-muted", "rclone-numeric"]);
-        meta.set_wrap(true);
-        meta.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        meta.set_max_width_chars(MEASURE);
-        selectable(&meta);
-        identity.append(&meta);
-        lead.append(&identity);
-        // Quiet actions first, so the main one ends on the same edge as the list's buttons.
-        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, GAP);
-        buttons.set_valign(gtk::Align::Center);
-        let button = |text: &str| {
-            let button = gtk::Button::with_label(text);
-            buttons.append(&button);
-            button
-        };
-        let remove = button("Remove…");
-        let edit = button("Edit…");
-        let unmount = button("Unmount…");
-        let mount = button("Mount");
-        let open = button("Open folder");
-        open.add_css_class("suggested-action");
-        lead.append(&buttons);
-        summary.append(&lead);
-
-        let send = |button: &gtk::Button, action: fn(u64, &Status) -> Action| {
-            let (tx, id, status) = (actions.clone(), id.clone(), status.clone());
-            button.connect_clicked(move |_| {
-                if let Some(id) = id.get() {
-                    let _ = tx.send(action(id, &status.borrow()));
-                }
-            });
-        };
-        send(&open, |id, _| Action::Open(id));
-        send(&unmount, |id, _| Action::Unmount(id));
-        send(&mount, |id, status| match view::primary(status) {
-            Primary::Cancel => Action::Unmount(id),
-            _ => Action::Mount(id),
-        });
-
-        let panes = gtk::Stack::new();
-        panes.set_vexpand(true);
-        panes.set_transition_type(gtk::StackTransitionType::Crossfade);
-        panes.set_transition_duration(120);
-        let uploads = QueuePane::new(&panes, UPLOADS, "Uploads");
-        let downloads = QueuePane::new(&panes, DOWNLOADS, "Downloads");
-        let log = gtk::TextView::new();
-        log.set_editable(false);
-        log.set_cursor_visible(false);
-        log.set_monospace(true);
-        log.set_wrap_mode(gtk::WrapMode::WordChar);
-        log.add_css_class("rclone-log");
-        log.set_left_margin(INSET);
-        log.set_right_margin(INSET);
-        log.set_top_margin(GAP);
-        log.set_bottom_margin(GAP);
-        let scroll = gtk::ScrolledWindow::builder()
-            .vexpand(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .child(&log)
-            .build();
-        panes.add_titled(&scroll, Some(LOG), "Log");
-        let switcher = gtk::StackSwitcher::new();
-        switcher.set_stack(Some(&panes));
-        switcher.remove_css_class("linked");
-        switcher.add_css_class("rclone-tabs");
-        switcher.set_halign(gtk::Align::Start);
-        switcher.set_margin_start(INSET - ROW_GAP);
-        let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        tabs.add_css_class("rclone-tabbar");
-        tabs.append(&switcher);
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        root.append(&summary);
-        root.append(&tabs);
-        root.append(&panes);
-        let title = label("", &["title"]);
-        title.set_xalign(0.5);
-        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        let subtitle = label("", &["subtitle"]);
-        subtitle.set_xalign(0.5);
-        subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        Self {
-            id,
-            status,
-            title,
-            subtitle,
-            problem,
-            folder,
-            meta,
-            open,
-            mount,
-            unmount,
-            edit,
-            remove,
-            panes,
-            uploads,
-            downloads,
-            log,
-            root,
-        }
+    fn file(paths: &Paths) -> PathBuf {
+        paths.config.with_file_name("theme")
     }
 
-    fn update(&self, snapshot: &Snapshot, home: Option<&std::path::Path>) {
-        let Some(id) = self.id.get() else { return };
-        let profile = snapshot.config.profiles.iter().find(|p| p.id == id);
-        let status = snapshot.statuses.get(&id).unwrap_or(&Status::Unmounted);
-        let sample = snapshot.activity.get(&id);
-        *self.status.borrow_mut() = status.clone();
-        let (state, tone) = view::activity_line(status, sample);
-        self.title.set_text(profile.map_or("", |p| &p.name));
-        self.subtitle.set_text(&state);
-        let problem = view::cache_warning(sample).or(view::status_hint(status));
-        self.problem.set_text(problem.unwrap_or(""));
-        self.problem.set_visible(problem.is_some());
-        set_tone(&self.problem, tone);
-        if let Some(profile) = profile {
-            let folder = view::short_path(&profile.mountpoint, home);
-            self.folder
-                .set_tooltip_text((folder.chars().count() > 40).then_some(folder.as_str()));
-            self.folder.set_text(&folder);
-            self.meta.set_text(&view::detail_line(profile, sample));
-        }
-        let primary = view::primary(status);
-        self.open.set_visible(primary == Primary::Open);
-        self.mount.set_visible(primary != Primary::Open);
-        self.mount.set_sensitive(primary != Primary::Unavailable);
-        self.mount.set_label(match primary {
-            Primary::Cancel => "Cancel mount…",
-            Primary::Unavailable => "Unmounting…",
-            _ => "Mount",
-        });
-        if primary == Primary::Mount {
-            self.mount.add_css_class("suggested-action");
-        } else {
-            self.mount.remove_css_class("suggested-action");
-        }
-        self.unmount.set_visible(*status == Status::Mounted);
-        self.edit.set_visible(!status.active());
-        self.remove.set_visible(!status.active());
-        let queues = view::queues(snapshot, id);
-        self.uploads.update(&queues.uploads);
-        self.downloads.update(&queues.downloads);
+    fn load(paths: &Paths) -> Self {
+        std::fs::read_to_string(Self::file(paths)).map_or(Self::System, |text| Self::parse(&text))
     }
 
-    fn load_log(&self, paths: &Paths) {
-        if let Some(id) = self.id.get() {
-            let buffer = self.log.buffer();
-            buffer.set_text(&read_log(paths, id));
-            // The newest lines are the useful ones. Wait for layout, then reveal them.
-            let view = self.log.downgrade();
-            glib::idle_add_local_once(move || {
-                if let Some(view) = view.upgrade() {
-                    let mut end = view.buffer().end_iter();
-                    view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
-                }
-            });
+    fn save(self, paths: &Paths) -> Result<(), String> {
+        let file = Self::file(paths);
+        std::fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::write(file, format!("{}\n", self.key())).map_err(|e| e.to_string())
+    }
+
+    fn apply(self, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::System => Theme::sync_system_appearance(Some(window), cx),
+            Self::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+            Self::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
         }
     }
 }
 
-struct Ui {
-    window: gtk::ApplicationWindow,
-    pages: gtk::Stack,
-    back: gtk::Button,
-    add: gtk::Button,
-    menu: gtk::MenuButton,
-    title: gtk::Label,
-    subtitle: gtk::Label,
-    banner: gtk::Box,
-    message: gtk::Label,
-    cancel_quit: gtk::Button,
-    empty: gtk::Box,
-    scroll: gtk::ScrolledWindow,
-    list: gtk::ListBox,
-    rows: RefCell<HashMap<u64, MountRow>>,
-    widths: gtk::SizeGroup,
-    detail: Detail,
-    state: Rc<RefCell<Snapshot>>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Uploads,
+    Downloads,
+    Log,
+}
+
+pub struct Shell {
     paths: Paths,
-    home: PathBuf,
-    requests: mpsc::Sender<Request>,
-    actions: mpsc::Sender<Action>,
+    home: Option<PathBuf>,
+    state: Snapshot,
+    link: Link,
+    incoming: Option<Receiver<String>>,
+    _guard: Option<InstanceGuard>,
+    detail: Option<u64>,
+    pane: Pane,
+    notice: Option<String>,
+    log: SharedString,
+    log_scroll: ScrollHandle,
+    list_scroll: ScrollHandle,
+    queue_scroll: UniformListScrollHandle,
+    focus: FocusHandle,
+    autostart: bool,
+    theme: ThemeChoice,
+    /// Measured cache size of unmounted profiles, by id. Mounted ones report it live.
+    usage: HashMap<u64, u64>,
+    /// Upload batch of each active mount, for overall progress that survives finished files.
+    batches: HashMap<u64, view::UploadBatch>,
+    clearing: Option<u64>,
+    editor: Option<WeakEntity<Editor>>,
+    _appearance: Subscription,
 }
 
-impl Ui {
-    fn say(&self, text: &str) {
-        self.message.set_text(text);
-        self.banner.set_visible(!text.is_empty());
+fn empty_snapshot() -> Snapshot {
+    Snapshot {
+        config: Config::default(),
+        remotes: vec![],
+        statuses: Default::default(),
+        activity: Default::default(),
+        message: String::new(),
+        quitting: false,
     }
+}
 
-    fn refresh_header(&self) {
-        let on_detail = self.detail.id.get().is_some();
-        let state = self.state.borrow();
-        let overview = view::overview(&state);
-        if !on_detail {
-            self.title.set_text(&overview.headline);
-            self.subtitle.set_text(&overview.detail);
-            self.subtitle.set_visible(!overview.detail.is_empty());
-        } else {
-            self.title.set_text(&self.detail.title.text());
-            self.subtitle.set_text(&self.detail.subtitle.text());
-            self.subtitle.set_visible(true);
-        }
-        self.back.set_visible(on_detail);
-        self.add.set_visible(!on_detail);
-        self.menu.set_visible(!on_detail);
+/// App-wide presentation settings, applied once before the window opens.
+pub fn init(cx: &mut App) {
+    // Follow a desktop that hides scrollbars until scrolling. Otherwise keep them visible, so a
+    // long queue or log shows at a glance that there is more and where you are in it.
+    let mode = if cx.should_auto_hide_scrollbars() {
+        ScrollbarMode::Scrolling
+    } else {
+        ScrollbarMode::Always
+    };
+    Theme::set_scrollbar_mode(mode, cx);
+}
+
+pub fn open(
+    cx: &mut App,
+    paths: Paths,
+    incoming: Option<(Receiver<String>, InstanceGuard)>,
+    action: Action,
+) {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(640.), px(520.)), cx)),
+        window_min_size: Some(size(px(420.), px(360.))),
+        window_decorations: Some(WindowDecorations::Client),
+        app_id: Some("io.github.rclone_tray.Settings".into()),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Rclone Tray".into()),
+            ..TitleBar::title_bar_options()
+        }),
+        ..TitleBar::window_options()
+    };
+    let opened = gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| Shell::new(paths, incoming, action, window, cx))
+    });
+    if let Err(error) = opened {
+        eprintln!("Cannot open the settings window: {error}");
+        cx.quit();
     }
+}
 
-    fn apply(&self, snapshot: Snapshot) {
-        self.say(&snapshot.message);
-        self.cancel_quit.set_visible(snapshot.quitting);
-        if snapshot.quitting && snapshot.message.is_empty() {
-            self.say("Quitting. Waiting for uploads and unmounts to finish.");
-        }
-        let quitting = snapshot.quitting;
-        self.add.set_sensitive(!quitting);
-        for action in ["add", "refresh", "quit"] {
-            if let Some(action) = self
-                .window
-                .lookup_action(action)
-                .and_downcast::<gio::SimpleAction>()
-            {
-                action.set_enabled(!quitting);
+impl Shell {
+    fn new(
+        paths: Paths,
+        incoming: Option<(Receiver<String>, InstanceGuard)>,
+        action: Action,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let theme = ThemeChoice::load(&paths);
+        theme.apply(window, cx);
+        let appearance = cx.observe_window_appearance(window, |this: &mut Self, window, cx| {
+            if this.theme == ThemeChoice::System {
+                Theme::sync_system_appearance(Some(window), cx);
             }
-        }
-        let empty = snapshot.config.profiles.is_empty();
-        self.empty.set_visible(empty);
-        self.scroll.set_visible(!empty);
-        self.render(&snapshot);
-        self.detail.update(&snapshot, Some(&self.home));
-        if let Some(id) = self.detail.id.get()
-            && !snapshot.config.profiles.iter().any(|p| p.id == id)
-        {
-            self.close_detail(false);
-        }
-        *self.state.borrow_mut() = snapshot;
-        self.refresh_header();
-    }
-
-    fn render(&self, state: &Snapshot) {
-        let mut rows = self.rows.borrow_mut();
-        rows.retain(|id, row| {
-            let keep = state
-                .config
-                .profiles
-                .iter()
-                .any(|p| p.id == *id && p == &row.profile);
-            if !keep {
-                self.list.remove(&row.root);
-            }
-            keep
         });
-        for (position, profile) in state.config.profiles.iter().enumerate() {
-            let status = state
-                .statuses
-                .get(&profile.id)
-                .unwrap_or(&Status::Unmounted);
-            let row = rows.entry(profile.id).or_insert_with(|| {
-                let row = MountRow::new(profile, status, &self.actions, &self.widths);
-                self.list.insert(&row.root, position as i32);
-                row
-            });
-            if row.root.index() != position as i32 {
-                self.list.remove(&row.root);
-                self.list.insert(&row.root, position as i32);
+        let (incoming, guard) = match incoming {
+            Some((rx, guard)) => (Some(rx), Some(guard)),
+            None => (None, None),
+        };
+        let socket = ipc::socket_path(&paths);
+        let (link, state) = match ipc::snapshot(&socket) {
+            Ok(state) => {
+                let (requests, events) = ipc::connect(socket);
+                (Link::Connected(requests, events), state)
             }
-            row.update(status, state.activity.get(&profile.id), Some(&self.home));
-        }
-    }
-
-    fn open_detail(&self, id: u64, pane: &str) {
-        self.detail.id.set(Some(id));
-        self.detail.panes.set_visible_child_name(pane);
-        self.detail.update(&self.state.borrow(), Some(&self.home));
-        // Hiding the focused row would hand focus to Back, and themes such as Breeze outline
-        // any focused button. Tab still starts at the page, and Escape works from anywhere.
-        gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
-        self.pages
-            .set_transition_type(gtk::StackTransitionType::SlideLeft);
-        self.pages.set_visible_child_name(DETAIL_PAGE);
-        self.refresh_header();
-        if pane == LOG {
-            self.detail.load_log(&self.paths);
-        }
-    }
-
-    fn close_detail(&self, keyboard: bool) {
-        let id = self.detail.id.take();
-        gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
-        self.pages
-            .set_transition_type(gtk::StackTransitionType::SlideRight);
-        self.pages.set_visible_child_name(LIST_PAGE);
-        self.refresh_header();
-        if keyboard
-            && let Some(row) = id.and_then(|id| self.rows.borrow().get(&id).map(|r| r.root.clone()))
-        {
-            row.grab_focus();
-        }
-    }
-
-    fn name(&self, id: u64) -> String {
-        let state = self.state.borrow();
-        let profile = state.config.profiles.iter().find(|p| p.id == id);
-        profile.map_or("this mount".into(), |p| p.name.clone())
-    }
-
-    fn handle(&self, action: Action) {
-        match action {
-            Action::Show => self.window.present(),
-            Action::Mount(id) => {
-                let _ = self.requests.send(Request::Mount(id));
-            }
-            Action::Unmount(id) => {
-                self.window.present();
-                let tx = self.requests.clone();
-                let status = self.state.borrow().statuses.get(&id).cloned();
-                let cancel = status.as_ref().map(view::primary) == Some(Primary::Cancel);
-                let name = self.name(id);
-                confirm(
-                    &self.window,
-                    Confirm {
-                        title: if cancel {
-                            format!("Cancel mounting {name}?")
-                        } else {
-                            format!("Unmount {name}?")
-                        },
-                        detail: "Close open files first. Unmounting is blocked while uploads are pending or transfer status is unavailable. Cached files are kept.",
-                        verb: if cancel { "Cancel mount" } else { "Unmount" },
-                        back: if cancel { "Keep mounting" } else { "Cancel" },
-                        destructive: false,
-                    },
-                    move || {
-                        let _ = tx.send(Request::Unmount(id));
-                    },
-                );
-            }
-            Action::Open(id) => {
-                if let Some(p) = self
-                    .state
-                    .borrow()
-                    .config
-                    .profiles
-                    .iter()
-                    .find(|p| p.id == id)
+            Err(_) => (
+                Link::Offline {
+                    error: None,
+                    starting: false,
+                },
+                empty_snapshot(),
+            ),
+        };
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let mut shell = Self {
+            autostart: paths.autostart.exists(),
+            theme,
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            paths,
+            state,
+            link,
+            incoming,
+            _guard: guard,
+            detail: None,
+            pane: Pane::Uploads,
+            notice: None,
+            log: SharedString::default(),
+            log_scroll: ScrollHandle::new(),
+            list_scroll: ScrollHandle::new(),
+            queue_scroll: UniformListScrollHandle::new(),
+            focus,
+            usage: HashMap::new(),
+            batches: HashMap::new(),
+            clearing: None,
+            editor: None,
+            _appearance: appearance,
+        };
+        shell.handle(action, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                if this
+                    .update_in(cx, |this, window, cx| this.pump(window, cx))
+                    .is_err()
                 {
-                    open_uri(
-                        &gio::File::for_path(&p.mountpoint).uri(),
-                        &self.message,
-                        &self.banner,
-                    );
+                    break;
                 }
             }
-            Action::Queue(id) => {
-                self.window.present();
-                self.open_detail(id, UPLOADS);
+        })
+        .detach();
+        shell
+    }
+
+    fn pump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut actions = vec![];
+        if let Some(incoming) = &self.incoming {
+            while let Ok(line) = incoming.try_recv() {
+                actions.push(serde_json::from_str(&line).unwrap_or(Action::Show));
             }
-            Action::Log(id) => {
-                self.window.present();
-                self.open_detail(id, LOG);
+        }
+        for action in actions {
+            self.handle(action, window, cx);
+        }
+        let mut events = vec![];
+        if let Link::Connected(_, receiver) = &self.link {
+            loop {
+                match receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        events.push(Event::Quit);
+                        break;
+                    }
+                }
             }
-            Action::Quit => {
-                self.window.present();
-                if self.state.borrow().quitting {
-                    let _ = self.requests.send(Request::CancelQuit);
+        }
+        for event in events {
+            match event {
+                Event::State(snapshot) => self.apply(snapshot, window, cx),
+                Event::Problem(problem) => {
+                    self.notice = Some(problem);
+                    cx.notify();
+                }
+                Event::Quit => {
+                    cx.quit();
                     return;
                 }
-                let tx = self.requests.clone();
-                confirm(
-                    &self.window,
-                    Confirm {
-                        title: "Quit Rclone Tray?".into(),
-                        detail: "Waits for uploads, unmounts this app’s mounts, then quits. Close open files first. Cached files are kept.",
-                        verb: "Quit",
-                        back: "Cancel",
-                        destructive: false,
-                    },
-                    move || {
-                        let _ = tx.send(Request::Quit);
-                    },
-                );
             }
         }
     }
-}
 
-fn window_action(
-    window: &gtk::ApplicationWindow,
-    name: &str,
-    run: impl Fn() + 'static,
-) -> gio::SimpleAction {
-    let action = gio::SimpleAction::new(name, None);
-    action.connect_activate(move |_, _| run());
-    window.add_action(&action);
-    action
-}
-
-pub fn build(app: &gtk::Application, paths: Paths, snapshot: Snapshot) {
-    style::install();
-    let (requests, events) = ipc::connect(ipc::socket_path(&paths));
-    let (actions, action_rx) = mpsc::channel();
-    let state = Rc::new(RefCell::new(snapshot));
-    let dispatch = gio::SimpleAction::new("dispatch", Some(glib::VariantTy::STRING));
-    let dispatch_tx = actions.clone();
-    dispatch.connect_activate(move |_, parameter| {
-        if let Some(action) = parameter
-            .and_then(|p| p.str())
-            .and_then(|json| serde_json::from_str::<Action>(json).ok())
+    fn apply(&mut self, snapshot: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.detail
+            && !snapshot.config.profiles.iter().any(|p| p.id == id)
         {
-            let _ = dispatch_tx.send(action);
+            self.detail = None;
         }
-    });
-    app.add_action(&dispatch);
-    app.set_accels_for_action("win.add", &["<Control>n"]);
-    app.set_accels_for_action("win.refresh", &["F5"]);
-    app.set_accels_for_action("win.quit", &["<Control>q"]);
-    let window = gtk::ApplicationWindow::builder()
-        .application(app)
-        .title("Rclone Tray")
-        .default_width(640)
-        .default_height(480)
-        .build();
-
-    let header = gtk::HeaderBar::new();
-    let heading = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    heading.set_valign(gtk::Align::Center);
-    let title = label("", &["title"]);
-    title.set_xalign(0.5);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    heading.append(&title);
-    let subtitle = label("", &["subtitle", "rclone-numeric"]);
-    subtitle.set_xalign(0.5);
-    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    heading.append(&subtitle);
-    header.set_title_widget(Some(&heading));
-    let back = gtk::Button::from_icon_name("go-previous-symbolic");
-    back.set_tooltip_text(Some("All mounts"));
-    header.pack_start(&back);
-    let add = gtk::Button::from_icon_name("list-add-symbolic");
-    add.set_tooltip_text(Some("Add mount"));
-    add.set_action_name(Some("win.add"));
-    header.pack_start(&add);
-    let menu_model = gio::Menu::new();
-    menu_model.append(Some("Refresh remotes"), Some("win.refresh"));
-    menu_model.append(Some("Start at login"), Some("win.autostart"));
-    let quit_section = gio::Menu::new();
-    quit_section.append(Some("Quit…"), Some("win.quit"));
-    menu_model.append_section(None, &quit_section);
-    let menu = gtk::MenuButton::new();
-    menu.set_icon_name("open-menu-symbolic");
-    menu.set_tooltip_text(Some("Menu"));
-    menu.set_menu_model(Some(&menu_model));
-    header.pack_end(&menu);
-    window.set_titlebar(Some(&header));
-
-    let banner_line = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
-    banner_line.add_css_class("rclone-banner");
-    let banner_icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
-    banner_icon.add_css_class("rclone-warning");
-    banner_icon.set_valign(gtk::Align::Start);
-    banner_icon.set_margin_top(ROW_GAP);
-    banner_icon.set_margin_start(INSET);
-    banner_line.append(&banner_icon);
-    let message = label("", &[]);
-    message.set_wrap(true);
-    message.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    message.set_max_width_chars(MEASURE);
-    selectable(&message);
-    message.set_hexpand(true);
-    message.set_margin_top(ROW_GAP);
-    message.set_margin_bottom(ROW_GAP);
-    message.set_margin_end(INSET);
-    banner_line.append(&message);
-    let cancel_quit = gtk::Button::with_label("Cancel quit");
-    cancel_quit.set_valign(gtk::Align::Center);
-    cancel_quit.set_margin_end(INSET);
-    cancel_quit.set_visible(false);
-    let tx = requests.clone();
-    cancel_quit.connect_clicked(move |_| {
-        let _ = tx.send(Request::CancelQuit);
-    });
-    banner_line.append(&cancel_quit);
-    let banner = banner_line;
-    banner.set_visible(false);
-
-    let list = gtk::ListBox::new();
-    list.add_css_class("rclone-ledger");
-    list.set_selection_mode(gtk::SelectionMode::None);
-    list.set_valign(gtk::Align::Start);
-    let scroll = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&list)
-        .build();
-    let empty = gtk::Box::new(gtk::Orientation::Vertical, GROUP_GAP);
-    empty.set_vexpand(true);
-    empty.set_valign(gtk::Align::Center);
-    empty.set_halign(gtk::Align::Center);
-    let empty_title = label("No mounts yet", &["rclone-empty-title"]);
-    empty_title.set_xalign(0.5);
-    empty.append(&empty_title);
-    let first = gtk::Button::with_label("Add mount");
-    first.add_css_class("suggested-action");
-    first.set_action_name(Some("win.add"));
-    first.set_halign(gtk::Align::Center);
-    empty.append(&first);
-    let overview = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    overview.append(&scroll);
-    overview.append(&empty);
-
-    let detail = Detail::new(&actions);
-    let pages = gtk::Stack::new();
-    pages.set_transition_duration(180);
-    pages.add_named(&overview, Some(LIST_PAGE));
-    pages.add_named(&detail.root, Some(DETAIL_PAGE));
-    pages.set_vexpand(true);
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.append(&banner);
-    content.append(&pages);
-    window.set_child(Some(&content));
-
-    let home = glib::home_dir();
-    let ui = Rc::new(Ui {
-        window: window.clone(),
-        pages,
-        back: back.clone(),
-        add,
-        menu,
-        title,
-        subtitle,
-        banner,
-        message,
-        cancel_quit,
-        empty,
-        scroll,
-        list,
-        rows: RefCell::new(HashMap::new()),
-        widths: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
-        detail,
-        state: state.clone(),
-        paths: paths.clone(),
-        home,
-        requests: requests.clone(),
-        actions: actions.clone(),
-    });
-
-    let details = gio::SimpleAction::new("details", Some(glib::VariantTy::UINT64));
-    let weak = Rc::downgrade(&ui);
-    details.connect_activate(move |_, parameter| {
-        if let (Some(ui), Some(id)) = (weak.upgrade(), parameter.and_then(|p| p.get::<u64>())) {
-            ui.open_detail(id, UPLOADS);
+        // A mount that just stopped has a cache worth measuring again.
+        if let Some(id) = self.detail
+            && self.status(id).active()
+            && !snapshot.statuses.get(&id).is_some_and(Status::active)
+        {
+            self.measure(id, cx);
         }
-    });
-    window.add_action(&details);
-    let weak = Rc::downgrade(&ui);
-    let parent = window.clone();
-    let tx = requests.clone();
-    window_action(&window, "add", move || {
-        if let Some(ui) = weak.upgrade() {
-            editor(&parent, &ui.state.borrow(), None, tx.clone());
+        if snapshot.remotes != self.state.remotes
+            && let Some(editor) = self.editor.as_ref().and_then(|e| e.upgrade())
+        {
+            let remotes = snapshot.remotes.clone();
+            editor.update(cx, |editor, cx| editor.set_remotes(remotes, window, cx));
         }
-    });
-    let tx = requests.clone();
-    window_action(&window, "refresh", move || {
-        let _ = tx.send(Request::Refresh);
-    });
-    let tx = actions.clone();
-    window_action(&window, "quit", move || {
-        let _ = tx.send(Action::Quit);
-    });
-    let autostart =
-        gio::SimpleAction::new_stateful("autostart", None, &paths.autostart.exists().to_variant());
-    let weak = Rc::downgrade(&ui);
-    autostart.connect_activate(move |action, _| {
-        let enabled = !action
-            .state()
-            .and_then(|s| s.get::<bool>())
-            .unwrap_or(false);
-        let Some(ui) = weak.upgrade() else { return };
-        match ui.paths.set_autostart(enabled) {
-            Ok(()) => action.set_state(&enabled.to_variant()),
-            Err(error) => ui.say(&format!("Cannot change login startup: {error}")),
+        self.state = snapshot;
+        let state = &self.state;
+        let active = |id: &u64| state.statuses.get(id).is_some_and(Status::active);
+        self.batches.retain(|id, _| active(id));
+        for (id, sample) in &state.activity {
+            if let Ok(activity) = sample
+                && active(id)
+            {
+                self.batches.entry(*id).or_default().observe(activity);
+            }
         }
-    });
-    window.add_action(&autostart);
+        cx.notify();
+    }
 
-    let weak = Rc::downgrade(&ui);
-    back.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            ui.close_detail(ui.window.gets_focus_visible());
+    fn send(&mut self, request: Request, cx: &mut Context<Self>) {
+        match &self.link {
+            Link::Connected(requests, _) => {
+                if requests.send(request).is_err() {
+                    self.notice = Some("Lost the connection to Rclone Tray.".into());
+                }
+            }
+            Link::Offline { .. } => self.notice = Some("Rclone Tray isn’t running.".into()),
         }
-    });
-    let weak = Rc::downgrade(&ui);
-    let parent = window.clone();
-    let tx = requests.clone();
-    ui.detail.edit.connect_clicked(move |_| {
-        let Some(ui) = weak.upgrade() else { return };
-        let state = ui.state.borrow();
-        let id = ui.detail.id.get();
-        let profile = state.config.profiles.iter().find(|p| Some(p.id) == id);
-        if let Some(profile) = profile {
-            editor(&parent, &state, Some(profile.clone()), tx.clone());
+        cx.notify();
+    }
+
+    fn profile(&self, id: u64) -> Option<&Profile> {
+        self.state.config.profiles.iter().find(|p| p.id == id)
+    }
+
+    fn status(&self, id: u64) -> &Status {
+        self.state.statuses.get(&id).unwrap_or(&Status::Unmounted)
+    }
+
+    fn handle(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            Action::Show => window.activate_window(),
+            Action::Mount(id) => self.send(Request::Mount(id), cx),
+            Action::Unmount(id) => {
+                window.activate_window();
+                self.confirm_unmount(id, window, cx);
+            }
+            Action::Open(id) => self.open_folder(id, cx),
+            Action::Queue(id) => {
+                window.activate_window();
+                self.open_detail(id, Pane::Uploads, window, cx);
+            }
+            Action::Log(id) => {
+                window.activate_window();
+                self.open_detail(id, Pane::Log, window, cx);
+            }
+            Action::Quit => {
+                window.activate_window();
+                self.quit(window, cx);
+            }
+            Action::QuitNow => self.send(Request::QuitNow, cx),
         }
-    });
-    let weak = Rc::downgrade(&ui);
-    let parent = window.clone();
-    let tx = requests.clone();
-    ui.detail.remove.connect_clicked(move |_| {
-        let Some(ui) = weak.upgrade() else { return };
-        let Some(id) = ui.detail.id.get() else { return };
-        let tx = tx.clone();
+    }
+
+    fn open_detail(&mut self, id: u64, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.profile(id).is_none() {
+            return;
+        }
+        self.detail = Some(id);
+        self.measure(id, cx);
+        self.select_pane(pane, window, cx);
+        cx.notify();
+    }
+
+    fn select_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        self.pane = pane;
+        if pane == Pane::Log {
+            self.load_log(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn load_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.detail else { return };
+        self.log = read_log(&self.paths, id).into();
+        // The newest lines are the useful ones. Reveal them once the text is laid out.
+        cx.on_next_frame(window, |this, _, cx| {
+            this.log_scroll.scroll_to_bottom();
+            cx.notify();
+        });
+    }
+
+    fn toggle(&mut self, id: u64, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if on {
+            self.send(Request::Mount(id), cx);
+        } else {
+            self.confirm_unmount(id, window, cx);
+        }
+    }
+
+    fn confirm_unmount(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.profile(id).map(|p| p.name.clone()) else {
+            return;
+        };
+        let cancel = view::primary(self.status(id)) == Primary::Cancel;
+        let this = cx.entity().downgrade();
         confirm(
-            &parent,
+            window,
+            cx,
             Confirm {
-                title: format!("Remove {}?", ui.name(id)),
-                detail: "Remote files and the local cache are not deleted.",
+                title: if cancel {
+                    format!("Stop mounting {name}?")
+                } else {
+                    format!("Unmount {name}?")
+                },
+                detail: "Close open files first. Cached files are kept.".into(),
+                verb: if cancel { "Stop mounting" } else { "Unmount" },
+                back: if cancel { "Keep mounting" } else { "Cancel" },
+                danger: false,
+            },
+            move |_, cx| {
+                let _ = this.update(cx, |this, cx| this.send(Request::Unmount(id), cx));
+            },
+        );
+    }
+
+    fn confirm_remove(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.profile(id).map(|p| p.name.clone()) else {
+            return;
+        };
+        let this = cx.entity().downgrade();
+        confirm(
+            window,
+            cx,
+            Confirm {
+                title: format!("Remove {name}?"),
+                detail: "Remote files and the local cache are kept.".into(),
                 verb: "Remove",
                 back: "Cancel",
-                destructive: true,
+                danger: true,
             },
-            move || {
-                let _ = tx.send(Request::Delete(id));
+            move |_, cx| {
+                let _ = this.update(cx, |this, cx| this.send(Request::Delete(id), cx));
             },
         );
-    });
-    let weak = Rc::downgrade(&ui);
-    ui.detail
-        .panes
-        .connect_visible_child_name_notify(move |panes| {
-            if panes.visible_child_name().as_deref() == Some(LOG)
-                && let Some(ui) = weak.upgrade()
-            {
-                ui.detail.load_log(&ui.paths);
-            }
-        });
-    let keys = gtk::EventControllerKey::new();
-    let weak = Rc::downgrade(&ui);
-    keys.connect_key_pressed(move |_, key, _, modifiers| {
-        let leave = key == gtk::gdk::Key::Escape
-            || (key == gtk::gdk::Key::Left && modifiers == gtk::gdk::ModifierType::ALT_MASK);
-        match weak.upgrade() {
-            Some(ui) if leave && ui.detail.id.get().is_some() => {
-                ui.close_detail(true);
-                glib::Propagation::Stop
-            }
-            _ => glib::Propagation::Proceed,
-        }
-    });
-    window.add_controller(keys);
-
-    let application = app.clone();
-    window.connect_close_request(move |_| {
-        application.quit();
-        glib::Propagation::Proceed
-    });
-    let first = state.borrow().clone();
-    ui.apply(first);
-    window.present();
-    let application = app.clone();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        while let Ok(event) = events.try_recv() {
-            match event {
-                Event::State(snapshot) => ui.apply(snapshot),
-                Event::Problem(problem) => ui.say(&problem),
-                Event::Quit => {
-                    application.quit();
-                    return glib::ControlFlow::Break;
-                }
-            }
-        }
-        while let Ok(action) = action_rx.try_recv() {
-            ui.handle(action);
-        }
-        glib::ControlFlow::Continue
-    });
-}
-
-fn set_queue_rows(model: &gio::ListStore, rows: &[QueueRow]) {
-    // Replace only changed rows so progress updates do not reset the whole list.
-    for (index, row) in rows.iter().enumerate() {
-        let index = index as u32;
-        let current = model
-            .item(index)
-            .map(|item| item.downcast::<glib::BoxedAnyObject>().unwrap());
-        if current
-            .as_ref()
-            .is_some_and(|item| *item.borrow::<QueueRow>() == *row)
-        {
-            continue;
-        }
-        model.splice(
-            index,
-            u32::from(current.is_some()),
-            &[glib::BoxedAnyObject::new(row.clone())],
-        );
     }
-    let count = rows.len() as u32;
-    if model.n_items() > count {
-        model.splice(
-            count,
-            model.n_items() - count,
-            &[] as &[glib::BoxedAnyObject],
-        );
-    }
-}
 
-fn field(
-    form: &gtk::Box,
-    text: &str,
-    widget: &impl IsA<gtk::Widget>,
-    target: &impl IsA<gtk::Widget>,
-    hint: Option<&str>,
-) {
-    let title = label(text, &["heading"]);
-    title.set_use_underline(true);
-    title.set_mnemonic_widget(Some(target));
-    let group = gtk::Box::new(gtk::Orientation::Vertical, FIELD_GAP);
-    group.append(&title);
-    group.append(widget);
-    if let Some(hint) = hint {
-        let hint = label(hint, &["rclone-muted"]);
-        hint.set_wrap(true);
-        group.append(&hint);
-    }
-    form.append(&group);
-}
-
-fn editor(
-    parent: &gtk::ApplicationWindow,
-    state: &Snapshot,
-    profile: Option<Profile>,
-    tx: mpsc::Sender<Request>,
-) {
-    let dialog = gtk::Window::builder()
-        .title(if profile.is_some() {
-            "Edit mount"
-        } else {
-            "Add mount"
+    fn measure(&mut self, id: u64, cx: &mut Context<Self>) {
+        let dir = self.paths.cache.join(id.to_string());
+        let task = cx.background_spawn(async move { backend::cache_usage(&dir) });
+        cx.spawn(async move |this, cx| {
+            let used = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.usage.insert(id, used);
+                cx.notify();
+            });
         })
-        .transient_for(parent)
-        .modal(true)
-        .default_width(480)
-        .default_height(520)
-        .build();
-    let header = gtk::HeaderBar::new();
-    header.set_show_title_buttons(false);
-    let cancel = gtk::Button::with_label("Cancel");
-    let d = dialog.clone();
-    cancel.connect_clicked(move |_| d.close());
-    header.pack_start(&cancel);
-    let save = gtk::Button::with_label("Save");
-    save.add_css_class("suggested-action");
-    header.pack_end(&save);
-    dialog.set_titlebar(Some(&header));
-    dialog.set_default_widget(Some(&save));
+        .detach();
+    }
 
-    let form = gtk::Box::new(gtk::Orientation::Vertical, GROUP_GAP);
-    style::inset(&form, INSET, INSET);
-    let error = wrapped(&["rclone-danger"]);
-    form.append(&error);
-    let name = gtk::Entry::new();
-    name.set_placeholder_text(Some("Work Drive"));
-    // A remote that left rclone's config stays listed, so saving cannot silently switch to
-    // another account. Validation then explains the problem.
-    let mut choices = state.remotes.clone();
-    if let Some(p) = &profile
-        && !choices.contains(&p.remote)
-    {
-        choices.insert(0, p.remote.clone());
-    }
-    let names: Vec<_> = choices.iter().map(String::as_str).collect();
-    let remote = gtk::DropDown::from_strings(&names);
-    let folder = gtk::Entry::new();
-    folder.set_placeholder_text(Some("Documents"));
-    let mountpoint = gtk::Entry::new();
-    mountpoint.set_placeholder_text(Some("/home/you/Cloud/Work"));
-    mountpoint.set_hexpand(true);
-    let mount_row = gtk::Box::new(gtk::Orientation::Horizontal, GAP);
-    mount_row.append(&mountpoint);
-    let browse = gtk::Button::with_label("Browse…");
-    let chooser_parent = dialog.clone();
-    let entry = mountpoint.clone();
-    browse.connect_clicked(move |_| {
-        let chooser = gtk::FileChooserNative::new(
-            Some("Choose an empty mount directory"),
-            Some(&chooser_parent),
-            gtk::FileChooserAction::SelectFolder,
-            Some("Choose"),
-            Some("Cancel"),
-        );
-        let entry = entry.clone();
-        chooser.connect_response(move |chooser, response| {
-            if response == gtk::ResponseType::Accept
-                && let Some(path) = chooser.file().and_then(|f| f.path())
-            {
-                entry.set_text(&path.to_string_lossy());
-            }
-            chooser.destroy();
-        });
-        chooser.show();
-    });
-    mount_row.append(&browse);
-    let cache = gtk::SpinButton::with_range(1.0, 100000.0, 1.0);
-    cache.set_value(10.0);
-    let auto = gtk::CheckButton::with_label("Mount when Rclone Tray starts");
-    if let Some(p) = &profile {
-        name.set_text(&p.name);
-        folder.set_text(&p.folder);
-        mountpoint.set_text(&p.mountpoint.to_string_lossy());
-        cache.set_value(p.cache_gib as f64);
-        auto.set_active(p.mount_at_start);
-        if let Some(index) = choices.iter().position(|r| *r == p.remote) {
-            remote.set_selected(index as u32);
-        }
-    }
-    field(&form, "_Name", &name, &name, None);
-    field(&form, "_Remote", &remote, &remote, None);
-    field(&form, "Remote _folder (optional)", &folder, &folder, None);
-    field(&form, "_Mount folder", &mount_row, &mountpoint, None);
-    field(
-        &form,
-        "_Cache target (GiB)",
-        &cache,
-        &cache,
-        Some("A target, not a hard limit. Open files and pending uploads can exceed it."),
-    );
-    form.append(&auto);
-    for entry in [&name, &folder, &mountpoint] {
-        entry.set_activates_default(true);
-    }
-    let d = dialog.clone();
-    let remotes = state.remotes.clone();
-    let body = form.clone();
-    save.connect_clicked(move |save| {
-        let p = Profile {
-            id: profile.as_ref().map_or(0, |p| p.id),
-            name: name.text().trim().into(),
-            remote: choices
-                .get(remote.selected() as usize)
-                .cloned()
-                .unwrap_or_default(),
-            folder: folder.text().into(),
-            mountpoint: PathBuf::from(mountpoint.text().as_str()),
-            cache_gib: cache.value_as_int() as u32,
-            mount_at_start: auto.is_active(),
+    fn confirm_clear(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.profile(id).map(|p| p.name.clone()) else {
+            return;
         };
-        if let Err(e) = backend::validate(&p, &remotes) {
-            error.set_text(&e);
-            error.set_visible(true);
+        let size = self.usage.get(&id).map(|bytes| byte_size(*bytes as f64));
+        let this = cx.entity().downgrade();
+        confirm(
+            window,
+            cx,
+            Confirm {
+                title: format!("Clear cache for {name}?"),
+                detail: match size {
+                    Some(size) => format!(
+                        "Deletes {size} of local copies. Remote files are kept and download again when opened."
+                    ),
+                    None => "Deletes local copies. Remote files are kept and download again when opened.".into(),
+                },
+                verb: "Clear cache",
+                back: "Cancel",
+                danger: true,
+            },
+            move |window, cx| {
+                let _ = this.update(cx, |this, cx| this.clear_cache(id, window, cx));
+            },
+        );
+    }
+
+    fn clear_cache(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let (reply, result) = mpsc::channel();
+        self.send(Request::ClearCache(id, reply), cx);
+        self.clearing = Some(id);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                match result.try_recv() {
+                    Ok(result) => break result,
+                    Err(TryRecvError::Empty) => continue,
+                    Err(TryRecvError::Disconnected) => {
+                        break Err("Lost the connection to Rclone Tray.".into());
+                    }
+                }
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.clearing = None;
+                match result {
+                    Ok(freed) => {
+                        this.usage.insert(id, 0);
+                        window.push_notification(
+                            Notification::success(format!("Cleared {}", byte_size(freed as f64))),
+                            cx,
+                        );
+                    }
+                    Err(error) => this.notice = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.quitting {
+            self.send(Request::CancelQuit, cx);
             return;
         }
-        let (saved, reply) = mpsc::channel();
-        if tx.send(Request::Save(p, saved)).is_err() {
-            error.set_text("Mount service unavailable. Restart the application.");
-            error.set_visible(true);
+        if matches!(self.link, Link::Offline { .. }) {
+            cx.quit();
             return;
         }
-        save.set_sensitive(false);
-        body.set_sensitive(false);
-        error.set_visible(false);
-        let dialog = d.downgrade();
-        let body = body.clone();
-        let save = save.clone();
-        let error = error.clone();
-        glib::timeout_add_local(Duration::from_millis(50), move || {
-            let Some(dialog) = dialog.upgrade().filter(|d| d.is_visible()) else {
-                return glib::ControlFlow::Break;
-            };
-            let result = match reply.try_recv() {
-                Ok(result) => result,
-                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                Err(_) => Err("Mount service stopped. Restart the application.".into()),
-            };
-            body.set_sensitive(true);
-            save.set_sensitive(true);
-            match result {
-                Ok(()) => dialog.close(),
-                Err(message) => {
-                    error.set_text(&message);
-                    error.set_visible(true);
+        let this = cx.entity().downgrade();
+        confirm(
+            window,
+            cx,
+            Confirm {
+                title: "Quit Rclone Tray?".into(),
+                detail: "Waits for uploads, then unmounts. Cached files are kept.".into(),
+                verb: "Quit",
+                back: "Cancel",
+                danger: false,
+            },
+            move |_, cx| {
+                let _ = this.update(cx, |this, cx| this.send(Request::Quit, cx));
+            },
+        );
+    }
+
+    fn open_folder(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile(id) else {
+            return;
+        };
+        let uri = gio::File::for_path(&profile.mountpoint).uri().to_string();
+        let task = cx.background_spawn(async move {
+            gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE)
+                .map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.notice = Some(format!("Cannot open folder: {error}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn edit(&mut self, profile: Option<Profile>, window: &mut Window, cx: &mut Context<Self>) {
+        let Link::Connected(requests, _) = &self.link else {
+            return;
+        };
+        if self.state.quitting {
+            return;
+        }
+        let editor = Editor::open(
+            &self.state.remotes,
+            profile,
+            self.home.clone(),
+            requests.clone(),
+            window,
+            cx,
+        );
+        self.editor = Some(editor.downgrade());
+    }
+
+    fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        match self.paths.set_autostart(enabled) {
+            Ok(()) => self.autostart = enabled,
+            Err(error) => self.notice = Some(format!("Cannot change login startup: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn set_theme(&mut self, theme: ThemeChoice, window: &mut Window, cx: &mut Context<Self>) {
+        self.theme = theme;
+        theme.apply(window, cx);
+        if let Err(error) = theme.save(&self.paths) {
+            self.notice = Some(format!("Cannot remember the theme: {error}"));
+        }
+        cx.notify();
+    }
+
+    fn start_backend(&mut self, cx: &mut Context<Self>) {
+        let Link::Offline { starting, .. } = &mut self.link else {
+            return;
+        };
+        *starting = true;
+        cx.notify();
+        let socket = ipc::socket_path(&self.paths);
+        let task = cx.background_spawn(async move {
+            let exe = std::env::current_exe()
+                .map_err(|e| e.to_string())?
+                .with_file_name("rclone-tray");
+            let mut child = std::process::Command::new(exe)
+                .arg("--background")
+                .spawn()
+                .map_err(|e| format!("Cannot start rclone-tray: {e}"))?;
+            std::thread::spawn(move || child.wait());
+            let mut last = String::new();
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(250));
+                match ipc::snapshot(&socket) {
+                    Ok(state) => return Ok(state),
+                    Err(error) => last = error,
                 }
             }
-            glib::ControlFlow::Break
+            Err(last)
         });
-    });
-    let scroll = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&form)
-        .build();
-    dialog.set_child(Some(&scroll));
-    let keys = gtk::EventControllerKey::new();
-    let close = dialog.downgrade();
-    keys.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Escape {
-            if let Some(dialog) = close.upgrade() {
-                dialog.close();
-            }
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(state) => {
+                        let (requests, events) = ipc::connect(ipc::socket_path(&this.paths));
+                        this.link = Link::Connected(requests, events);
+                        this.state = state;
+                    }
+                    Err(error) => {
+                        this.link = Link::Offline {
+                            error: Some(error),
+                            starting: false,
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // MARK: Actions bound to keys
+
+    fn on_add(&mut self, _: &AddMount, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit(None, window, cx);
+    }
+
+    fn on_refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.link, Link::Connected(..)) {
+            self.send(Request::Refresh, cx);
         }
-    });
-    dialog.add_controller(keys);
-    dialog.present();
+    }
+
+    fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        self.quit(window, cx);
+    }
+
+    fn on_back(&mut self, _: &Back, window: &mut Window, cx: &mut Context<Self>) {
+        if self.detail.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
+    }
+}
+
+// MARK: Rendering
+
+impl Render for Shell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match (&self.link, self.detail) {
+            (Link::Offline { error, starting }, _) => self
+                .render_offline(error.clone(), *starting, cx)
+                .into_any_element(),
+            (_, Some(id)) => self.render_detail(id, window, cx).into_any_element(),
+            (_, None) => self.render_list(cx).into_any_element(),
+        };
+        v_flex()
+            .id("shell")
+            .key_context(CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::on_add))
+            .on_action(cx.listener(Self::on_refresh))
+            .on_action(cx.listener(Self::on_quit))
+            .on_action(cx.listener(Self::on_back))
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(self.render_title_bar(cx))
+            .children(self.render_banners(cx))
+            .child(body)
+    }
+}
+
+impl Shell {
+    fn render_title_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let connected = matches!(self.link, Link::Connected(..));
+        let lead = match self.detail.and_then(|id| self.profile(id)) {
+            Some(profile) => h_flex()
+                .gap_1()
+                .min_w_0()
+                .child(
+                    Button::new("back")
+                        .ghost()
+                        .small()
+                        .icon(IconName::ArrowLeft)
+                        .tooltip("All mounts")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.on_back(&Back, window, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .font_semibold()
+                        .child(profile.name.clone()),
+                ),
+            None => h_flex().text_sm().font_semibold().child("Rclone Tray"),
+        };
+        let this = cx.entity().downgrade();
+        let autostart = self.autostart;
+        let current = self.theme;
+        let menu = Button::new("menu")
+            .ghost()
+            .small()
+            .icon(IconName::Ellipsis)
+            .tooltip("More")
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let (refresh, login, quit) = (this.clone(), this.clone(), this.clone());
+                let mut menu = menu
+                    .item(
+                        PopupMenuItem::new("Refresh remotes").on_click(move |_, window, cx| {
+                            let _ = refresh
+                                .update(cx, |this, cx| this.on_refresh(&Refresh, window, cx));
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Start at login")
+                            .checked(autostart)
+                            .on_click(move |_, _, cx| {
+                                let _ =
+                                    login.update(cx, |this, cx| this.set_autostart(!autostart, cx));
+                            }),
+                    )
+                    .separator();
+                for choice in ThemeChoice::ALL {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label())
+                            .checked(choice == current)
+                            .on_click(move |_, window, cx| {
+                                let _ =
+                                    this.update(cx, |this, cx| this.set_theme(choice, window, cx));
+                            }),
+                    );
+                }
+                menu.separator()
+                    .item(PopupMenuItem::new("Quit…").on_click(move |_, window, cx| {
+                        let _ = quit.update(cx, |this, cx| this.quit(window, cx));
+                    }))
+            });
+        let add = (self.detail.is_none() && connected && !self.state.config.profiles.is_empty())
+            .then(|| {
+                Button::new("add")
+                    .outline()
+                    .small()
+                    .icon(IconName::Plus)
+                    .label("Add mount")
+                    .disabled(self.state.quitting)
+                    .tooltip("Ctrl+N")
+                    .on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx)))
+            });
+        TitleBar::new()
+            .bg(cx.theme().background)
+            .border_color(style::rule(cx))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .justify_between()
+                    .pr_2()
+                    .child(lead)
+                    .child(h_flex().gap_1().children(add).child(menu)),
+            )
+    }
+
+    fn render_banners(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut banners = vec![];
+        if self.state.quitting {
+            let text = if self.state.message.is_empty() {
+                "Quitting…".to_string()
+            } else {
+                self.state.message.clone()
+            };
+            let waiting = !text.starts_with("Unmounting");
+            banners.push(
+                banner("quitting", &text, Tone::Busy, cx)
+                    .when(waiting, |this| {
+                        this.child(
+                            Button::new("quit-now")
+                                .outline()
+                                .xsmall()
+                                .label("Quit now")
+                                .tooltip("Pending uploads resume the next time you mount")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.send(Request::QuitNow, cx)),
+                                ),
+                        )
+                    })
+                    .child(
+                        Button::new("cancel-quit")
+                            .outline()
+                            .xsmall()
+                            .label("Cancel quit")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.send(Request::CancelQuit, cx)),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        } else if !self.state.message.is_empty() {
+            let tone = if self.state.message.ends_with('…') {
+                Tone::Busy
+            } else {
+                Tone::Warning
+            };
+            banners.push(banner("message", &self.state.message, tone, cx).into_any_element());
+        }
+        if let Some(notice) = self.notice.clone() {
+            banners.push(
+                banner("notice", &notice, Tone::Danger, cx)
+                    .child(
+                        Button::new("dismiss")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Dismiss")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.notice = None;
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        banners
+    }
+
+    fn render_offline(
+        &self,
+        error: Option<String>,
+        starting: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .px(style::INSET)
+            .child(
+                Icon::new(IconName::HardDrive)
+                    .size(px(32.))
+                    .text_color(style::muted(cx)),
+            )
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_semibold()
+                            .child("Rclone Tray isn’t running"),
+                    )
+                    .children(error.map(|error| {
+                        div()
+                            .max_w(px(420.))
+                            .text_sm()
+                            .text_center()
+                            .text_color(cx.theme().danger)
+                            .child(error)
+                    })),
+            )
+            .child(
+                Button::new("start")
+                    .primary()
+                    .label("Start Rclone Tray")
+                    .loading(starting)
+                    .disabled(starting)
+                    .on_click(cx.listener(|this, _, _, cx| this.start_backend(cx))),
+            )
+    }
+
+    fn render_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.state.config.profiles.is_empty() {
+            return self.render_empty(cx).into_any_element();
+        }
+        let mut overview = view::overview(&self.state);
+        if self.state.quitting {
+            // The banner above owns quit progress.
+            overview.facts.clear();
+        }
+        let attention = overview
+            .facts
+            .first()
+            .is_some_and(|fact| fact.ends_with("attention"));
+        let header = h_flex()
+            .px(style::INSET)
+            .pt_4()
+            .pb_2()
+            .gap_3()
+            .items_baseline()
+            .child(div().text_lg().font_semibold().child(overview.headline))
+            .children(overview.facts.into_iter().map(|fact| {
+                div()
+                    .text_sm()
+                    .text_color(if attention {
+                        cx.theme().danger
+                    } else {
+                        style::muted(cx)
+                    })
+                    .child(fact)
+            }));
+        let rows: Vec<_> = self
+            .state
+            .config
+            .profiles
+            .clone()
+            .into_iter()
+            .map(|profile| self.render_row(profile, cx).into_any_element())
+            .collect();
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(header)
+            .child(
+                div()
+                    .id("mounts")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.list_scroll)
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_empty(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let discovering = self.state.message.ends_with('…');
+        let no_remotes = self.state.remotes.is_empty() && !discovering;
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .px(style::INSET)
+            .child(
+                Icon::new(IconName::HardDrive)
+                    .size(px(32.))
+                    .text_color(style::muted(cx)),
+            )
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().text_lg().font_semibold().child("No mounts yet"))
+                    .when(no_remotes, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(style::muted(cx))
+                                .child("Add a remote with rclone config, then refresh."),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .when(no_remotes, |this| {
+                        this.child(
+                            Button::new("refresh")
+                                .outline()
+                                .icon(IconName::RefreshCw)
+                                .label("Refresh")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.on_refresh(&Refresh, window, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("first")
+                            .primary()
+                            .icon(IconName::Plus)
+                            .label("Add mount")
+                            .disabled(no_remotes || self.state.quitting)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.edit(None, window, cx)),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_row(&mut self, profile: Profile, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = profile.id;
+        let status = self.status(id).clone();
+        let sample = self.state.activity.get(&id);
+        let (facts, tone) = view::activity_line(&status, sample);
+        let note = view::ledger_note(&status, facts);
+        let progress = self.batches.get(&id).and_then(view::UploadBatch::progress);
+        let primary = view::primary(&status);
+        let quitting = self.state.quitting;
+        let row_id = SharedString::from(format!("mount-{id}"));
+        div()
+            .id(row_id.clone())
+            .relative()
+            .h(style::MOUNT_ROW)
+            .flex()
+            .items_center()
+            .gap_3()
+            .px(style::INSET)
+            .border_b_1()
+            .border_color(style::rule(cx))
+            .cursor_pointer()
+            .hover(|this| this.bg(style::hover(cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_detail(id, Pane::Uploads, window, cx)
+            }))
+            .child(controls().child(self.mount_switch(id, &status, &profile.name, quitting, cx)))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .when(!status.active(), |this| this.text_color(style::muted(cx)))
+                            .child(profile.name.clone()),
+                    )
+                    .child(
+                        style::path(div())
+                            .text_xs()
+                            .text_color(style::muted(cx))
+                            .child(view::short_path(&profile.mountpoint, self.home.as_deref())),
+                    ),
+            )
+            .child(status_note(note, tone, cx))
+            .child(
+                controls().child(
+                    Button::new(SharedString::from(format!("open-{id}")))
+                        .ghost()
+                        .small()
+                        .icon(IconName::FolderOpen)
+                        .tooltip("Open folder")
+                        .disabled(primary != Primary::Open)
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_folder(id, cx))),
+                ),
+            )
+            .child(
+                Button::new(SharedString::from(format!("details-{id}")))
+                    .ghost()
+                    .small()
+                    .icon(IconName::ChevronRight)
+                    .tooltip("Details")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_detail(id, Pane::Uploads, window, cx)
+                    })),
+            )
+            .children(progress.map(|fraction| progress_rail(fraction, cx)))
+    }
+
+    fn mount_switch(
+        &self,
+        id: u64,
+        status: &Status,
+        name: &str,
+        quitting: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let locked = matches!(status, Status::Unmounting | Status::External) || quitting;
+        let tooltip = match status {
+            Status::External => "Mounted by another session".to_string(),
+            Status::Unmounting => "Unmounting…".to_string(),
+            _ if quitting => "Quitting…".to_string(),
+            _ if status.active() => format!("Unmount {name}"),
+            _ => format!("Mount {name}"),
+        };
+        Switch::new(SharedString::from(format!("switch-{id}")))
+            .checked(status.active())
+            .disabled(locked)
+            .tooltip(tooltip.clone())
+            .accessibility_label(tooltip)
+            .on_click(
+                cx.listener(move |this, on: &bool, window, cx| this.toggle(id, *on, window, cx)),
+            )
+    }
+
+    fn render_detail(
+        &mut self,
+        id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(profile) = self.profile(id).cloned() else {
+            return div().into_any_element();
+        };
+        let status = self.status(id).clone();
+        let sample = self.state.activity.get(&id);
+        let (_, tone) = view::activity_line(&status, sample);
+        let problem = view::cache_warning(sample)
+            .or(view::status_hint(&status))
+            .map(str::to_string);
+        let mounted = view::primary(&status) == Primary::Open;
+        let active = status.active();
+        let busy = matches!(
+            status,
+            Status::Mounting | Status::Recovering | Status::Unmounting
+        );
+        let quitting = self.state.quitting;
+        let queues = view::queues(&self.state, id);
+
+        let identity = h_flex()
+            .gap_4()
+            .items_center()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        style::path(div())
+                            .text_lg()
+                            .font_semibold()
+                            .child(view::short_path(&profile.mountpoint, self.home.as_deref())),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .text_sm()
+                            .text_color(style::muted(cx))
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .child(
+                                        div().flex_shrink_0().child(format!("{}:", profile.remote)),
+                                    )
+                                    .child(
+                                        style::path(div()).min_w_0().child(profile.folder.clone()),
+                                    ),
+                            )
+                            .child(div().flex_shrink_0().child(view::cache_line(
+                                &profile,
+                                sample,
+                                self.usage.get(&id).copied(),
+                            ))),
+                    ),
+            )
+            .child(
+                Button::new("open")
+                    .primary()
+                    .icon(IconName::FolderOpen)
+                    .label("Open folder")
+                    .disabled(!mounted)
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_folder(id, cx))),
+            );
+
+        let controls = h_flex()
+            .gap_2()
+            .items_center()
+            .child(self.mount_switch(id, &status, &profile.name, quitting, cx))
+            .child(div().text_sm().child(status.label().to_string()))
+            .when(busy, |this| {
+                this.child(Spinner::new().small().color(style::muted(cx)))
+            })
+            .child(div().flex_1())
+            .child(
+                Button::new("clear-cache")
+                    .ghost()
+                    .small()
+                    .label("Clear cache")
+                    .loading(self.clearing == Some(id))
+                    .disabled(
+                        active
+                            || quitting
+                            || self.clearing.is_some()
+                            || self.usage.get(&id) == Some(&0),
+                    )
+                    .tooltip(if active {
+                        "Unmount to clear cache"
+                    } else if self.usage.get(&id) == Some(&0) {
+                        "Cache is empty"
+                    } else {
+                        "Delete local copies"
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.confirm_clear(id, window, cx)),
+                    ),
+            )
+            .child(
+                Button::new("edit")
+                    .ghost()
+                    .small()
+                    .label("Edit")
+                    .disabled(active || quitting)
+                    .tooltip(if active {
+                        "Unmount to edit"
+                    } else {
+                        "Edit mount"
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let profile = this.profile(id).cloned();
+                        if profile.is_some() {
+                            this.edit(profile, window, cx);
+                        }
+                    })),
+            )
+            .child(
+                Button::new("remove")
+                    .ghost()
+                    .small()
+                    .label("Remove")
+                    .disabled(active || quitting)
+                    .tooltip(if active {
+                        "Unmount to remove"
+                    } else {
+                        "Remove mount"
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.confirm_remove(id, window, cx)),
+                    ),
+            );
+
+        let count = |pane: &view::QueuePane| (!pane.rows.is_empty()).then_some(pane.rows.len());
+        let tab = |label: &'static str, count: Option<usize>, cx: &App| {
+            Tab::new().label(label).when_some(count, |tab, count| {
+                tab.suffix(
+                    div()
+                        .ml_1()
+                        .text_xs()
+                        .text_color(style::muted(cx))
+                        .child(count.to_string()),
+                )
+            })
+        };
+        let selected = match self.pane {
+            Pane::Uploads => 0,
+            Pane::Downloads => 1,
+            Pane::Log => 2,
+        };
+        let tabs = TabBar::new("panes")
+            .underline()
+            .px(style::INSET)
+            .selected_index(selected)
+            .child(tab("Uploads", count(&queues.uploads), cx))
+            .child(tab("Downloads", count(&queues.downloads), cx))
+            .child(tab("Log", None, cx))
+            .when(self.pane == Pane::Log, |this| {
+                this.suffix(
+                    Button::new("reload-log")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::RefreshCw)
+                        .tooltip("Reload log")
+                        .on_click(cx.listener(|this, _, window, cx| this.load_log(window, cx))),
+                )
+            })
+            .on_click(cx.listener(|this, index: &usize, window, cx| {
+                let pane = match index {
+                    0 => Pane::Uploads,
+                    1 => Pane::Downloads,
+                    _ => Pane::Log,
+                };
+                this.select_pane(pane, window, cx);
+            }));
+
+        let pane = match self.pane {
+            Pane::Uploads => self
+                .render_queue(id, true, queues.uploads, cx)
+                .into_any_element(),
+            Pane::Downloads => self
+                .render_queue(id, false, queues.downloads, cx)
+                .into_any_element(),
+            Pane::Log => self.render_log(window, cx).into_any_element(),
+        };
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(
+                v_flex()
+                    .px(style::INSET)
+                    .pt_4()
+                    .pb_3()
+                    .gap_3()
+                    .when_some(problem, |this, problem| {
+                        this.child(
+                            h_flex()
+                                .gap_2()
+                                .items_start()
+                                .text_sm()
+                                .text_color(style::tone(tone, cx))
+                                .when(matches!(tone, Tone::Warning | Tone::Danger), |this| {
+                                    this.child(
+                                        Icon::new(IconName::TriangleAlert)
+                                            .small()
+                                            .flex_shrink_0()
+                                            .mt(px(2.)),
+                                    )
+                                })
+                                .child(div().flex_1().min_w_0().child(problem)),
+                        )
+                    })
+                    .child(identity)
+                    .child(controls),
+            )
+            .child(tabs)
+            .child(pane)
+            .into_any_element()
+    }
+
+    fn render_queue(
+        &mut self,
+        id: u64,
+        uploads: bool,
+        pane: view::QueuePane,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        if pane.rows.is_empty() {
+            return v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .px(style::INSET)
+                .text_sm()
+                .text_color(style::muted(cx))
+                .children(pane.facts)
+                .children(
+                    pane.hint
+                        .map(|hint| div().text_xs().max_w(px(420.)).text_center().child(hint)),
+                )
+                .into_any_element();
+        }
+        let count = pane.rows.len();
+        let batch = uploads
+            .then(|| self.batches.get(&id))
+            .flatten()
+            .filter(|batch| batch.totals().is_some());
+        // The summary is the queue's first ledger line: the whole batch's rail on its edge,
+        // each file's own rail on the rows below.
+        let header = h_flex()
+            .relative()
+            .px(style::INSET)
+            .py_2()
+            .gap_3()
+            .border_b_1()
+            .border_color(style::rule(cx))
+            .text_xs()
+            .text_color(style::muted(cx))
+            .children(pane.facts)
+            .children(batch.and_then(view::UploadBatch::summary))
+            .children(pane.hint)
+            .children(
+                batch
+                    .and_then(view::UploadBatch::progress)
+                    .map(|fraction| progress_rail(fraction, cx)),
+            );
+        let list = uniform_list(
+            "queue",
+            count,
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                let queues = view::queues(&this.state, id);
+                let rows = if uploads {
+                    queues.uploads.rows
+                } else {
+                    queues.downloads.rows
+                };
+                range
+                    .filter_map(|index| rows.get(index).cloned())
+                    .map(|row| queue_row(row, cx).into_any_element())
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .track_scroll(&self.queue_scroll);
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(header)
+            .child(
+                v_flex()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .vertical_scrollbar(&self.queue_scroll),
+            )
+            .into_any_element()
+    }
+
+    fn render_log(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = if self.log.is_empty() {
+            SharedString::from("No log yet. It appears after the first mount attempt.")
+        } else {
+            self.log.clone()
+        };
+        let log = div()
+            .id("log")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.log_scroll)
+            .px(style::INSET)
+            .py_3()
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_xs()
+            .when(self.log.is_empty(), |this| {
+                this.text_color(style::muted(cx))
+            })
+            .child(text);
+        // The scrollbar overlays a non-scrolling wrapper, so it stays put while the log moves.
+        v_flex()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(log)
+            .vertical_scrollbar(&self.log_scroll)
+    }
+}
+
+/// Holds controls inside a clickable row. A press here belongs to the control, so it never
+/// also opens the row's details.
+fn controls() -> Div {
+    h_flex().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+}
+
+fn queue_row(row: view::QueueRow, cx: &App) -> impl IntoElement {
+    div()
+        .relative()
+        .w_full()
+        .h(style::QUEUE_ROW)
+        .px(style::INSET)
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap_1()
+        .border_b_1()
+        .border_color(style::rule(cx))
+        .child(style::path(div()).min_w_0().text_sm().child(row.name))
+        .child(
+            h_flex()
+                .gap_3()
+                .text_xs()
+                .text_color(style::muted(cx))
+                .children(row.facts),
+        )
+        .when(row.progress > 0.0, |this| {
+            this.child(progress_rail(row.progress, cx))
+        })
+}
+
+/// The row's lower edge fills with the progress of its transfers.
+fn progress_rail(fraction: f64, cx: &App) -> impl IntoElement {
+    div()
+        .absolute()
+        .left_0()
+        .bottom_0()
+        .h(style::RAIL)
+        .w(relative(fraction as f32))
+        .bg(style::rail(cx))
+}
+
+/// Live state beside a mount: a spinner while it works, an icon when it needs a decision.
+fn status_note(facts: Vec<String>, tone: Tone, cx: &App) -> impl IntoElement {
+    h_flex()
+        .flex_shrink_0()
+        .gap_3()
+        .text_xs()
+        .text_color(style::tone(tone, cx))
+        .when(tone == Tone::Busy && !facts.is_empty(), |this| {
+            this.child(Spinner::new().xsmall().color(style::muted(cx)))
+        })
+        .when(matches!(tone, Tone::Warning | Tone::Danger), |this| {
+            this.child(Icon::new(IconName::TriangleAlert).xsmall())
+        })
+        .children(facts)
+}
+
+fn banner(id: &'static str, text: &str, tone: Tone, cx: &App) -> Stateful<Div> {
+    let color = style::tone(tone, cx);
+    h_flex()
+        .id(id)
+        .gap_2()
+        .px(style::INSET)
+        .py_2()
+        .bg(cx.theme().muted)
+        .border_b_1()
+        .border_color(style::rule(cx))
+        .text_sm()
+        .child(match tone {
+            Tone::Busy => Spinner::new().small().color(color).into_any_element(),
+            _ => Icon::new(IconName::TriangleAlert)
+                .small()
+                .text_color(color)
+                .into_any_element(),
+        })
+        .child(div().flex_1().min_w_0().child(text.to_string()))
 }
 
 struct Confirm {
     title: String,
-    detail: &'static str,
+    detail: String,
     verb: &'static str,
     back: &'static str,
-    destructive: bool,
+    danger: bool,
 }
 
-fn confirm(parent: &gtk::ApplicationWindow, request: Confirm, yes: impl Fn() + 'static) {
-    let dialog = gtk::MessageDialog::builder()
-        .transient_for(parent)
-        .modal(true)
-        .text(&request.title)
-        .secondary_text(request.detail)
-        .build();
-    dialog.add_button(request.back, gtk::ResponseType::Cancel);
-    let accept = dialog.add_button(request.verb, gtk::ResponseType::Ok);
-    if request.destructive {
-        accept.add_css_class("destructive-action");
-    }
-    dialog.set_default_response(gtk::ResponseType::Cancel);
-    dialog.connect_response(move |dialog, response| {
-        if response == gtk::ResponseType::Ok {
-            yes();
-        }
-        dialog.close();
+fn confirm(
+    window: &mut Window,
+    cx: &mut App,
+    request: Confirm,
+    yes: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let yes = Rc::new(yes);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let (enter, click) = (yes.clone(), yes.clone());
+        let accept = Button::new("confirm")
+            .label(request.verb)
+            .on_click(move |_, window, cx| {
+                click(window, cx);
+                window.close_dialog(cx);
+            });
+        dialog
+            .title(request.title.clone())
+            .w(px(400.))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(style::muted(cx))
+                    .child(request.detail.clone()),
+            )
+            .button_props(DialogButtonProps::default().on_ok(move |_, window, cx| {
+                enter(window, cx);
+                true
+            }))
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("back")
+                            .outline()
+                            .label(request.back)
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(if request.danger {
+                        accept.danger()
+                    } else {
+                        accept.primary()
+                    }),
+            )
     });
-    dialog.present();
-}
-
-fn open_uri(uri: &str, message: &gtk::Label, banner: &gtk::Box) {
-    let label = message.clone();
-    let banner = banner.clone();
-    gio::AppInfo::launch_default_for_uri_async(
-        uri,
-        None::<&gio::AppLaunchContext>,
-        None::<&gio::Cancellable>,
-        move |result| {
-            if let Err(e) = result {
-                label.set_text(&format!("Cannot open folder: {e}"));
-                banner.set_visible(true);
-            }
-        },
-    );
 }
 
 fn read_log(paths: &Paths, id: u64) -> String {
@@ -1344,5 +1599,19 @@ fn read_log(paths: &Paths, id: u64) -> String {
         file.read_to_end(&mut bytes)?;
         Ok::<_, std::io::Error>(String::from_utf8_lossy(&bytes).into_owned())
     })()
-    .unwrap_or_else(|_| "No log yet. A log appears after the first mount attempt.".into())
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThemeChoice;
+
+    #[test]
+    fn theme_choice_round_trips_and_defaults_to_the_system() {
+        for choice in ThemeChoice::ALL {
+            assert_eq!(ThemeChoice::parse(&format!("{}\n", choice.key())), choice);
+        }
+        assert_eq!(ThemeChoice::parse(""), ThemeChoice::System);
+        assert_eq!(ThemeChoice::parse("solarized"), ThemeChoice::System);
+    }
 }
