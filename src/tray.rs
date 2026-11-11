@@ -205,6 +205,8 @@ mod tests {
             folder: String::new(),
             mountpoint: "/tmp/test-tray".into(),
             cache_gib: 1,
+            upload_threads: 4,
+            download_threads: 4,
             mount_at_start: false,
         };
         let mut second = profile.clone();

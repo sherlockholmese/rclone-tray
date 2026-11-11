@@ -361,6 +361,10 @@ impl Worker {
                 .arg(self.paths.cache.join(id.to_string()))
                 .arg("--vfs-cache-max-size")
                 .arg(format!("{}G", profile.cache_gib))
+                .arg("--transfers")
+                .arg(profile.upload_threads.to_string())
+                .arg("--multi-thread-streams")
+                .arg(profile.download_threads.to_string())
                 .arg("--log-level")
                 .arg("INFO")
                 .arg("--rc")
@@ -798,6 +802,8 @@ mod tests {
             folder: String::new(),
             mountpoint: dir.path().join("not-mounted"),
             cache_gib: 1,
+            upload_threads: 4,
+            download_threads: 4,
             mount_at_start: false,
         };
         // A live, controllable process with no FUSE mount. EOF produces a startup failure.
@@ -952,6 +958,8 @@ mod tests {
             folder: String::new(),
             mountpoint: dir.path().join("not-mounted"),
             cache_gib: 1,
+            upload_threads: 4,
+            download_threads: 4,
             mount_at_start: false,
         };
         let child = Command::new("sh")
@@ -1083,6 +1091,8 @@ mod tests {
             folder: source.to_string_lossy().into_owned(),
             mountpoint: dir.path().join("mount with spaces"),
             cache_gib: 1,
+            upload_threads: 4,
+            download_threads: 4,
             mount_at_start: false,
         };
         let (tx, events) = start(paths.clone(), Config::default());

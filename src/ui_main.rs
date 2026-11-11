@@ -31,6 +31,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
+            ui::init(cx);
             cx.bind_keys([
                 KeyBinding::new("ctrl-n", ui::AddMount, Some(ui::CONTEXT)),
                 KeyBinding::new("f5", ui::Refresh, Some(ui::CONTEXT)),

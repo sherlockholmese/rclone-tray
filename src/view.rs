@@ -4,7 +4,7 @@ use crate::{
     config::Profile,
     control::{Activity, Transfer, byte_size},
 };
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
@@ -206,17 +206,75 @@ pub fn queued_uploads(activity: &Activity) -> Option<u64> {
         .or_else(|| activity.cache.as_ref().ok().map(|c| c.uploads_queued))
 }
 
-/// Share of the active transfers' known bytes. Unknown sizes are left out, never estimated.
-pub fn progress(status: &Status, sample: Option<&Result<Activity, String>>) -> Option<f64> {
-    if !status.active() {
-        return None;
+/// Overall progress of the uploads pending together on one mount. A batch begins when the first
+/// upload appears and ends when none remain, so the bar does not restart with every file. Files
+/// that leave the queue count as sent. Unknown sizes are left out, never estimated.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UploadBatch {
+    /// Size and bytes sent of each upload pending in the last sample.
+    pending: HashMap<String, (u64, u64)>,
+    /// Bytes of the uploads that left the queue during this batch.
+    finished: u64,
+}
+
+impl UploadBatch {
+    pub fn observe(&mut self, activity: &Activity) {
+        let mut now: HashMap<String, (u64, u64)> = HashMap::new();
+        if let Ok(queue) = &activity.uploads {
+            for item in queue.iter().filter(|item| item.size > 0) {
+                let size = item.size as u64;
+                // Between samples a finished transfer can vanish before its queue entry does.
+                // Keep what it already sent rather than dropping the bar back.
+                let sent = match self.pending.get(&item.name) {
+                    Some(&(before, sent)) if item.uploading && before == size => sent,
+                    _ => 0,
+                };
+                now.insert(item.name.clone(), (size, sent));
+            }
+        }
+        for transfer in &activity.transfers {
+            if transfer.direction() == "Uploading" && transfer.size > 0 {
+                let size = transfer.size as u64;
+                now.insert(transfer.name.clone(), (size, transfer.bytes.min(size)));
+            }
+        }
+        if now.is_empty() {
+            *self = Self::default();
+            return;
+        }
+        for (name, (size, _)) in &self.pending {
+            if !now.contains_key(name) {
+                self.finished += size;
+            }
+        }
+        self.pending = now;
     }
-    let activity = sample?.as_ref().ok()?;
-    let known = activity.transfers.iter().filter(|t| t.size > 0);
-    let (bytes, size) = known.fold((0.0, 0.0), |(bytes, size), t| {
-        (bytes + t.bytes as f64, size + t.size as f64)
-    });
-    (size > 0.0).then(|| (bytes / size).clamp(0.0, 1.0))
+
+    /// Bytes sent and bytes in the whole batch, while uploads are pending.
+    pub fn totals(&self) -> Option<(u64, u64)> {
+        let (size, sent) = self
+            .pending
+            .values()
+            .fold((0, 0), |(size, sent), &(s, b)| (size + s, sent + b));
+        let total = self.finished + size;
+        (!self.pending.is_empty() && total > 0).then_some((self.finished + sent, total))
+    }
+
+    pub fn progress(&self) -> Option<f64> {
+        self.totals()
+            .map(|(sent, total)| (sent as f64 / total as f64).clamp(0.0, 1.0))
+    }
+
+    /// The batch in words, beside the queue it summarizes.
+    pub fn summary(&self) -> Option<String> {
+        self.totals().map(|(sent, total)| {
+            format!(
+                "{} of {} uploaded",
+                byte_size(sent as f64),
+                byte_size(total as f64)
+            )
+        })
+    }
 }
 
 pub fn short_path(path: &Path, home: Option<&Path>) -> String {
@@ -457,6 +515,8 @@ mod tests {
             folder: String::new(),
             mountpoint: PathBuf::from(format!("/home/you/{id}")),
             cache_gib: 10,
+            upload_threads: 4,
+            download_threads: 4,
             mount_at_start: false,
         }
     }
@@ -598,16 +658,56 @@ mod tests {
     }
 
     #[test]
-    fn progress_is_proportional_and_skips_unknown_sizes() {
-        let mut activity = idle();
-        activity.transfers = vec![transfer(1000, 250), transfer(3000, 750), transfer(-1, 99)];
-        let sample = Ok(activity);
-        assert_eq!(progress(&Status::Mounted, Some(&sample)), Some(0.25));
-        assert_eq!(progress(&Status::Unmounted, Some(&sample)), None);
-        assert_eq!(progress(&Status::Mounted, Some(&Ok(idle()))), None);
-        let mut unknown = idle();
-        unknown.transfers = vec![transfer(-1, 99)];
-        assert_eq!(progress(&Status::Mounted, Some(&Ok(unknown))), None);
+    fn upload_progress_covers_the_whole_batch_and_skips_unknown_sizes() {
+        let sized = |name: &str, size: i64, uploading: bool| QueuedUpload {
+            size,
+            uploading,
+            ..queued(name)
+        };
+        let sending = |name: &str, size: i64, bytes: u64| Transfer {
+            name: name.into(),
+            ..transfer(size, bytes)
+        };
+        let mut batch = UploadBatch::default();
+        assert_eq!(batch.progress(), None);
+
+        // Two files of 1000 bytes, the first half sent; a third of unknown size is ignored.
+        let mut sample = idle();
+        sample.uploads = Ok(vec![
+            sized("a", 1000, true),
+            sized("b", 1000, false),
+            sized("c", -1, false),
+        ]);
+        sample.transfers = vec![sending("a", 1000, 500)];
+        batch.observe(&sample);
+        assert_eq!(batch.totals(), Some((500, 2000)));
+
+        // The transfer ends before its queue entry: what it sent is kept.
+        sample.transfers.clear();
+        batch.observe(&sample);
+        assert_eq!(batch.totals(), Some((500, 2000)));
+
+        // "a" finished and stays counted, so the bar continues instead of restarting.
+        sample.uploads = Ok(vec![sized("b", 1000, true)]);
+        sample.transfers = vec![sending("b", 1000, 250)];
+        batch.observe(&sample);
+        assert_eq!(batch.totals(), Some((1250, 2000)));
+        assert_eq!(batch.progress(), Some(0.625));
+        assert_eq!(batch.summary().unwrap(), "1.2 KiB of 2.0 KiB uploaded");
+
+        // A new file joins the running batch.
+        sample.uploads = Ok(vec![sized("b", 1000, true), sized("d", 2000, false)]);
+        batch.observe(&sample);
+        assert_eq!(batch.totals(), Some((1250, 4000)));
+
+        // Nothing left: the batch ends, and the next one starts from zero.
+        batch.observe(&idle());
+        assert_eq!(batch.progress(), None);
+        assert_eq!(batch.summary(), None);
+        sample.uploads = Ok(vec![sized("e", 100, false)]);
+        sample.transfers.clear();
+        batch.observe(&sample);
+        assert_eq!(batch.totals(), Some((0, 100)));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use gpui_kit::component::{
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
+    scroll::{ScrollableElement as _, ScrollbarMode},
     spinner::Spinner,
     switch::Switch,
     tab::{Tab, TabBar},
@@ -126,6 +127,8 @@ pub struct Shell {
     theme: ThemeChoice,
     /// Measured cache size of unmounted profiles, by id. Mounted ones report it live.
     usage: HashMap<u64, u64>,
+    /// Upload batch of each active mount, for overall progress that survives finished files.
+    batches: HashMap<u64, view::UploadBatch>,
     clearing: Option<u64>,
     editor: Option<WeakEntity<Editor>>,
     _appearance: Subscription,
@@ -140,6 +143,18 @@ fn empty_snapshot() -> Snapshot {
         message: String::new(),
         quitting: false,
     }
+}
+
+/// App-wide presentation settings, applied once before the window opens.
+pub fn init(cx: &mut App) {
+    // Follow a desktop that hides scrollbars until scrolling. Otherwise keep them visible, so a
+    // long queue or log shows at a glance that there is more and where you are in it.
+    let mode = if cx.should_auto_hide_scrollbars() {
+        ScrollbarMode::Scrolling
+    } else {
+        ScrollbarMode::Always
+    };
+    Theme::set_scrollbar_mode(mode, cx);
 }
 
 pub fn open(
@@ -221,6 +236,7 @@ impl Shell {
             queue_scroll: UniformListScrollHandle::new(),
             focus,
             usage: HashMap::new(),
+            batches: HashMap::new(),
             clearing: None,
             editor: None,
             _appearance: appearance,
@@ -301,6 +317,16 @@ impl Shell {
             editor.update(cx, |editor, cx| editor.set_remotes(remotes, window, cx));
         }
         self.state = snapshot;
+        let state = &self.state;
+        let active = |id: &u64| state.statuses.get(id).is_some_and(Status::active);
+        self.batches.retain(|id, _| active(id));
+        for (id, sample) in &state.activity {
+            if let Ok(activity) = sample
+                && active(id)
+            {
+                self.batches.entry(*id).or_default().observe(activity);
+            }
+        }
         cx.notify();
     }
 
@@ -1007,7 +1033,7 @@ impl Shell {
         let sample = self.state.activity.get(&id);
         let (facts, tone) = view::activity_line(&status, sample);
         let note = view::ledger_note(&status, facts);
-        let progress = view::progress(&status, sample);
+        let progress = self.batches.get(&id).and_then(view::UploadBatch::progress);
         let primary = view::primary(&status);
         let quitting = self.state.quitting;
         let row_id = SharedString::from(format!("mount-{id}"));
@@ -1344,14 +1370,29 @@ impl Shell {
                 .into_any_element();
         }
         let count = pane.rows.len();
+        let batch = uploads
+            .then(|| self.batches.get(&id))
+            .flatten()
+            .filter(|batch| batch.totals().is_some());
+        // The summary is the queue's first ledger line: the whole batch's rail on its edge,
+        // each file's own rail on the rows below.
         let header = h_flex()
+            .relative()
             .px(style::INSET)
             .py_2()
             .gap_3()
+            .border_b_1()
+            .border_color(style::rule(cx))
             .text_xs()
             .text_color(style::muted(cx))
             .children(pane.facts)
-            .children(pane.hint);
+            .children(batch.and_then(view::UploadBatch::summary))
+            .children(pane.hint)
+            .children(
+                batch
+                    .and_then(view::UploadBatch::progress)
+                    .map(|fraction| progress_rail(fraction, cx)),
+            );
         let list = uniform_list(
             "queue",
             count,
@@ -1374,7 +1415,14 @@ impl Shell {
             .flex_1()
             .min_h_0()
             .child(header)
-            .child(list)
+            .child(
+                v_flex()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .vertical_scrollbar(&self.queue_scroll),
+            )
             .into_any_element()
     }
 
@@ -1384,7 +1432,7 @@ impl Shell {
         } else {
             self.log.clone()
         };
-        div()
+        let log = div()
             .id("log")
             .flex_1()
             .min_h_0()
@@ -1397,7 +1445,14 @@ impl Shell {
             .when(self.log.is_empty(), |this| {
                 this.text_color(style::muted(cx))
             })
-            .child(text)
+            .child(text);
+        // The scrollbar overlays a non-scrolling wrapper, so it stays put while the log moves.
+        v_flex()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(log)
+            .vertical_scrollbar(&self.log_scroll)
     }
 }
 
@@ -1410,6 +1465,7 @@ fn controls() -> Div {
 fn queue_row(row: view::QueueRow, cx: &App) -> impl IntoElement {
     div()
         .relative()
+        .w_full()
         .h(style::QUEUE_ROW)
         .px(style::INSET)
         .flex()
@@ -1418,7 +1474,7 @@ fn queue_row(row: view::QueueRow, cx: &App) -> impl IntoElement {
         .gap_1()
         .border_b_1()
         .border_color(style::rule(cx))
-        .child(div().truncate().text_sm().child(row.name))
+        .child(style::path(div()).min_w_0().text_sm().child(row.name))
         .child(
             h_flex()
                 .gap_3()

@@ -193,6 +193,8 @@ mod tests {
                     folder: String::new(),
                     mountpoint: "/tmp/work files".into(),
                     cache_gib: 1,
+                    upload_threads: 4,
+                    download_threads: 4,
                     mount_at_start: false,
                 }],
             },

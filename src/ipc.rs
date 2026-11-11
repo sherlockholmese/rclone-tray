@@ -348,6 +348,8 @@ mod tests {
                     folder: "Reports/日本語".into(),
                     mountpoint: dir.path().join("work files"),
                     cache_gib: 3,
+                    upload_threads: 4,
+                    download_threads: 4,
                     mount_at_start: false,
                 }],
             },

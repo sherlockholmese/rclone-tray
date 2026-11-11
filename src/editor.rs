@@ -14,7 +14,7 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::*, *};
 use rclone_tray::{
     backend::{self, Request},
-    config::Profile,
+    config::{self, Profile},
 };
 use std::{
     path::PathBuf,
@@ -31,6 +31,8 @@ pub struct Editor {
     folder: Entity<InputState>,
     mountpoint: Entity<InputState>,
     cache: Entity<InputState>,
+    uploads: Entity<InputState>,
+    downloads: Entity<InputState>,
     at_start: bool,
     error: Option<String>,
     saving: bool,
@@ -129,6 +131,23 @@ impl Editor {
                 .validate(|text, _| text.chars().all(|c| c.is_ascii_digit()) && text.len() <= 6)
                 .default_value(p.map_or(10, |p| p.cache_gib).to_string())
         });
+        let threads = |value: u32, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .validate(|text, _| text.chars().all(|c| c.is_ascii_digit()) && text.len() <= 3)
+                    .default_value(value.to_string())
+            })
+        };
+        let uploads = threads(
+            p.map_or_else(config::default_threads, |p| p.upload_threads),
+            window,
+            cx,
+        );
+        let downloads = threads(
+            p.map_or_else(config::default_threads, |p| p.download_threads),
+            window,
+            cx,
+        );
         let choices = Self::choices(remotes, p);
         let selected = p
             .and_then(|p| choices.iter().position(|r| *r == p.remote))
@@ -136,7 +155,7 @@ impl Editor {
             .map(IndexPath::new);
         let remote = cx.new(|cx| SelectState::new(choices.clone(), selected, window, cx));
         let mut subscriptions = vec![];
-        for input in [&name, &folder, &mountpoint, &cache] {
+        for input in [&name, &folder, &mountpoint, &cache, &uploads, &downloads] {
             subscriptions.push(
                 cx.subscribe_in(input, window, |this, _, event, window, cx| match event {
                     InputEvent::PressEnter { .. } => this.save(window, cx),
@@ -155,6 +174,8 @@ impl Editor {
             folder,
             mountpoint,
             cache,
+            uploads,
+            downloads,
             error: None,
             saving: false,
             requests,
@@ -234,12 +255,16 @@ impl Editor {
             folder: text(&self.folder, cx).trim().into(),
             mountpoint: PathBuf::from(text(&self.mountpoint, cx).trim()),
             cache_gib: text(&self.cache, cx).parse().unwrap_or(0),
+            upload_threads: text(&self.uploads, cx).parse().unwrap_or(0),
+            download_threads: text(&self.downloads, cx).parse().unwrap_or(0),
             mount_at_start: self.at_start,
         };
         let checked = if profile.mountpoint.as_os_str().is_empty() {
             Err("Choose a mount folder.".to_string())
         } else if profile.cache_gib == 0 {
             Err("Give the cache at least 1 GiB.".to_string())
+        } else if profile.upload_threads == 0 || profile.download_threads == 0 {
+            Err("Use at least 1 transfer thread.".to_string())
         } else {
             backend::validate(&profile, &self.remotes)
         };
@@ -353,14 +378,36 @@ impl Render for Editor {
                             .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx))),
                     ),
             ))
-            .child(field(
-                "Cache target",
-                div().w(px(160.)).child(
-                    Input::new(&self.cache)
-                        .suffix(div().text_sm().text_color(style::muted(cx)).child("GiB"))
-                        .disabled(self.saving),
-                ),
-            ))
+            .child(
+                h_flex()
+                    .gap_4()
+                    .child(
+                        field(
+                            "Cache target",
+                            Input::new(&self.cache)
+                                .suffix(div().text_sm().text_color(style::muted(cx)).child("GiB"))
+                                .disabled(self.saving),
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    )
+                    .child(
+                        field(
+                            "Upload threads",
+                            Input::new(&self.uploads).disabled(self.saving),
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    )
+                    .child(
+                        field(
+                            "Download threads",
+                            Input::new(&self.downloads).disabled(self.saving),
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    ),
+            )
             .child(
                 Checkbox::new("at-start")
                     .label("Mount when Rclone Tray starts")
