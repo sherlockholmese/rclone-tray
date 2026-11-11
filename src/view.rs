@@ -166,6 +166,29 @@ pub fn activity_line(
 }
 
 /// The switch already says mounted or not. Row text is for anything else.
+/// A mount row's live facts in two lines that mirror its name and path: what is moving now
+/// beside the name, what remains beside the path. Two fixed lines at every width, so the row
+/// never grows. Problems and plain states keep the single line `activity_line` gives them.
+pub fn ledger_lines(
+    status: &Status,
+    sample: Option<&Result<Activity, String>>,
+    batch: Option<&UploadBatch>,
+) -> (Vec<String>, Vec<String>, Tone) {
+    let (facts, tone) = activity_line(status, sample);
+    if let (Status::Mounted, Some(Ok(activity)), Tone::Ok) = (status, sample, tone) {
+        let r = activity.rates();
+        let now = rates(r.upload, r.download, r.other);
+        let mut rest: Vec<String> = queued_text(queued_uploads(activity).unwrap_or(0))
+            .into_iter()
+            .collect();
+        rest.extend(batch.and_then(UploadBatch::time_left));
+        if !now.is_empty() || !rest.is_empty() {
+            return (now, rest, tone);
+        }
+    }
+    (ledger_note(status, facts), vec![], tone)
+}
+
 pub fn ledger_note(status: &Status, facts: Vec<String>) -> Vec<String> {
     let plain = facts.len() == 1 && facts[0] == status.label();
     if plain && matches!(status, Status::Mounted | Status::Unmounted) {
@@ -215,6 +238,24 @@ pub struct UploadBatch {
     pending: HashMap<String, (u64, u64)>,
     /// Bytes of the uploads that left the queue during this batch.
     finished: u64,
+    /// Combined speed of the uploads moving in the last sample, in bytes per second.
+    rate: f64,
+}
+
+/// Time to move `bytes` at `rate`. Coarse past a minute, so it does not flicker between
+/// samples. None when nothing is moving: an estimate is never invented.
+pub fn time_left(bytes: u64, rate: f64) -> Option<String> {
+    if bytes == 0 || rate < 1.0 {
+        return None;
+    }
+    let seconds = (bytes as f64 / rate).ceil() as u64;
+    let minutes = seconds.div_ceil(60);
+    Some(match seconds {
+        0..60 => format!("{seconds}s left"),
+        60..3600 => format!("{minutes} min left"),
+        _ if minutes.is_multiple_of(60) => format!("{} h left", minutes / 60),
+        _ => format!("{} h {} min left", minutes / 60, minutes % 60),
+    })
 }
 
 impl UploadBatch {
@@ -232,16 +273,19 @@ impl UploadBatch {
                 now.insert(item.name.clone(), (size, sent));
             }
         }
+        let mut rate = 0.0;
         for transfer in &activity.transfers {
             if transfer.direction() == "Uploading" && transfer.size > 0 {
                 let size = transfer.size as u64;
                 now.insert(transfer.name.clone(), (size, transfer.bytes.min(size)));
+                rate += transfer.speed_avg;
             }
         }
         if now.is_empty() {
             *self = Self::default();
             return;
         }
+        self.rate = rate;
         for (name, (size, _)) in &self.pending {
             if !now.contains_key(name) {
                 self.finished += size;
@@ -274,6 +318,12 @@ impl UploadBatch {
                 byte_size(total as f64)
             )
         })
+    }
+
+    /// The rest of the batch at the current upload speed.
+    pub fn time_left(&self) -> Option<String> {
+        self.totals()
+            .and_then(|(sent, total)| time_left(total - sent, self.rate))
     }
 }
 
@@ -467,6 +517,17 @@ fn download_pane(activity: &Activity) -> QueuePane {
     } else {
         format!("{} downloading", rows.len())
     }];
+    // With one download its row already says this. Several share the line, so add them up,
+    // counting only downloads whose size is known.
+    if rows.len() > 1 {
+        let (left, rate) = activity
+            .transfers
+            .iter()
+            .filter(|t| t.direction() == "Downloading")
+            .filter_map(|t| remaining(t).map(|left| (left, t.speed_avg)))
+            .fold((0, 0.0), |(left, rate), (l, r)| (left + l, rate + r));
+        facts.extend(time_left(left, rate));
+    }
     if unknown > 0 {
         facts.push(format!("{unknown} unclassified"));
     }
@@ -475,6 +536,11 @@ fn download_pane(activity: &Activity) -> QueuePane {
         hint: None,
         rows,
     }
+}
+
+/// Bytes still to move, when the size is known.
+fn remaining(transfer: &Transfer) -> Option<u64> {
+    (transfer.size > 0).then(|| (transfer.size as u64).saturating_sub(transfer.bytes))
 }
 
 fn transfer_row(transfer: &Transfer) -> QueueRow {
@@ -487,9 +553,11 @@ fn transfer_row(transfer: &Transfer) -> QueueRow {
     } else {
         format!("{} transferred", byte_size(transfer.bytes as f64))
     };
+    let mut facts = vec![amount, format!("{}/s", byte_size(transfer.speed_avg))];
+    facts.extend(remaining(transfer).and_then(|left| time_left(left, transfer.speed_avg)));
     QueueRow {
         name: transfer.name.clone(),
-        facts: vec![amount, format!("{}/s", byte_size(transfer.speed_avg))],
+        facts,
         progress: if transfer.size > 0 {
             (transfer.bytes as f64 / transfer.size as f64).clamp(0.0, 1.0)
         } else {
@@ -658,6 +726,59 @@ mod tests {
     }
 
     #[test]
+    fn ledger_lines_put_motion_beside_the_name_and_what_remains_beside_the_path() {
+        let mut sample = idle();
+        sample.uploads = Ok(vec![queued("a"), queued("b")]);
+        sample.transfers = vec![transfer(4096, 0)];
+        let mut batch = UploadBatch::default();
+        batch.observe(&sample);
+        let sample = Ok(sample);
+        let (now, rest, tone) = ledger_lines(&Status::Mounted, Some(&sample), Some(&batch));
+        assert_eq!(now, ["↑ 2.0 KiB/s"]);
+        assert_eq!(rest, ["2 queued", "3s left"]);
+        assert_eq!(tone, Tone::Ok);
+        // Problems and plain states stay on one line, with no estimate beside them.
+        let (now, rest, _) = ledger_lines(&Status::Unmounted, None, Some(&batch));
+        assert_eq!((now, rest), (vec![], vec![]));
+        let down = Err("down".to_string());
+        let (now, rest, tone) = ledger_lines(&Status::Mounted, Some(&down), Some(&batch));
+        assert_eq!(
+            (now, rest, tone),
+            (vec!["Activity unavailable".into()], vec![], Tone::Warning)
+        );
+    }
+
+    #[test]
+    fn time_left_is_coarse_and_never_invented() {
+        assert_eq!(time_left(0, 100.0), None);
+        assert_eq!(time_left(1000, 0.0), None);
+        assert_eq!(time_left(1000, 100.0).unwrap(), "10s left");
+        assert_eq!(time_left(5_900, 100.0).unwrap(), "59s left");
+        assert_eq!(time_left(6_000, 100.0).unwrap(), "1 min left");
+        assert_eq!(time_left(6_100, 100.0).unwrap(), "2 min left");
+        assert_eq!(time_left(360_000, 100.0).unwrap(), "1 h left");
+        assert_eq!(time_left(450_000, 100.0).unwrap(), "1 h 15 min left");
+
+        // Several downloads share one estimate; a single one leaves it to its row.
+        let download = |name: &str, size: i64, bytes: u64| Transfer {
+            name: name.into(),
+            src_fs: Some("work:".into()),
+            dst_fs: None,
+            ..transfer(size, bytes)
+        };
+        let mut sample = idle();
+        sample.transfers = vec![download("a", 10_000_000, 0)];
+        let pane = download_pane(&sample);
+        assert_eq!(pane.facts, ["1 downloading"]);
+        assert_eq!(pane.rows[0].facts[2], "1 h 22 min left");
+        sample.transfers.push(download("b", 4096, 0));
+        assert_eq!(
+            download_pane(&sample).facts,
+            ["2 downloading", "41 min left"]
+        );
+    }
+
+    #[test]
     fn upload_progress_covers_the_whole_batch_and_skips_unknown_sizes() {
         let sized = |name: &str, size: i64, uploading: bool| QueuedUpload {
             size,
@@ -694,6 +815,8 @@ mod tests {
         assert_eq!(batch.totals(), Some((1250, 2000)));
         assert_eq!(batch.progress(), Some(0.625));
         assert_eq!(batch.summary().unwrap(), "1.2 KiB of 2.0 KiB uploaded");
+        // 750 bytes left at the 2 KiB/s of the one moving upload.
+        assert_eq!(batch.time_left().unwrap(), "1s left");
 
         // A new file joins the running batch.
         sample.uploads = Ok(vec![sized("b", 1000, true), sized("d", 2000, false)]);
@@ -760,7 +883,10 @@ mod tests {
         state.activity.insert(1, Ok(starting));
         let pane = queues(&state, 1).uploads;
         assert_eq!(pane.facts, ["Upload queue unavailable"]);
-        assert_eq!(pane.rows[0].facts, ["500 B of 1000 B", "2.0 KiB/s"]);
+        assert_eq!(
+            pane.rows[0].facts,
+            ["500 B of 1000 B", "2.0 KiB/s", "1s left"]
+        );
         assert_eq!(pane.rows.len(), 1);
         assert_eq!(pane.rows[0].progress, 0.5);
         assert_eq!(queues(&state, 9).uploads.facts, ["Mount removed"]);

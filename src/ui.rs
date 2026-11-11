@@ -935,7 +935,9 @@ impl Shell {
             .px(style::INSET)
             .pt_4()
             .pb_2()
-            .gap_3()
+            .gap_x_3()
+            .flex_wrap()
+            .whitespace_nowrap()
             .items_baseline()
             .child(div().text_lg().font_semibold().child(overview.headline))
             .children(overview.facts.into_iter().map(|fact| {
@@ -961,13 +963,20 @@ impl Shell {
             .min_h_0()
             .child(header)
             .child(
-                div()
-                    .id("mounts")
+                v_flex()
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.list_scroll)
-                    .children(rows),
+                    .child(
+                        div()
+                            .id("mounts")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.list_scroll)
+                            .children(rows),
+                    )
+                    .vertical_scrollbar(&self.list_scroll),
             )
             .into_any_element()
     }
@@ -1031,9 +1040,9 @@ impl Shell {
         let id = profile.id;
         let status = self.status(id).clone();
         let sample = self.state.activity.get(&id);
-        let (facts, tone) = view::activity_line(&status, sample);
-        let note = view::ledger_note(&status, facts);
-        let progress = self.batches.get(&id).and_then(view::UploadBatch::progress);
+        let batch = self.batches.get(&id);
+        let (now, rest, tone) = view::ledger_lines(&status, sample, batch);
+        let progress = batch.and_then(view::UploadBatch::progress);
         let primary = view::primary(&status);
         let quitting = self.state.quitting;
         let row_id = SharedString::from(format!("mount-{id}"));
@@ -1056,7 +1065,7 @@ impl Shell {
             .child(
                 v_flex()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(style::NAME_MIN)
                     .child(
                         div()
                             .truncate()
@@ -1072,7 +1081,7 @@ impl Shell {
                             .child(view::short_path(&profile.mountpoint, self.home.as_deref())),
                     ),
             )
-            .child(status_note(note, tone, cx))
+            .child(status_note(now, rest, tone, cx))
             .child(
                 controls().child(
                     Button::new(SharedString::from(format!("open-{id}")))
@@ -1380,13 +1389,16 @@ impl Shell {
             .relative()
             .px(style::INSET)
             .py_2()
-            .gap_3()
+            .gap_x_3()
+            .flex_wrap()
+            .whitespace_nowrap()
             .border_b_1()
             .border_color(style::rule(cx))
             .text_xs()
             .text_color(style::muted(cx))
             .children(pane.facts)
             .children(batch.and_then(view::UploadBatch::summary))
+            .children(batch.and_then(view::UploadBatch::time_left))
             .children(pane.hint)
             .children(
                 batch
@@ -1499,19 +1511,29 @@ fn progress_rail(fraction: f64, cx: &App) -> impl IntoElement {
 }
 
 /// Live state beside a mount: a spinner while it works, an icon when it needs a decision.
-fn status_note(facts: Vec<String>, tone: Tone, cx: &App) -> impl IntoElement {
-    h_flex()
-        .flex_shrink_0()
-        .gap_3()
+/// Live state beside a mount, right-aligned in up to two lines that sit beside its name and
+/// path. It gives way to the name, which keeps at least `style::NAME_MIN`.
+fn status_note(facts: Vec<String>, rest: Vec<String>, tone: Tone, cx: &App) -> impl IntoElement {
+    let line = || h_flex().justify_end().gap_3();
+    v_flex()
+        .min_w_0()
+        .overflow_hidden()
+        .items_end()
+        .gap_0p5()
+        .whitespace_nowrap()
         .text_xs()
         .text_color(style::tone(tone, cx))
-        .when(tone == Tone::Busy && !facts.is_empty(), |this| {
-            this.child(Spinner::new().xsmall().color(style::muted(cx)))
-        })
-        .when(matches!(tone, Tone::Warning | Tone::Danger), |this| {
-            this.child(Icon::new(IconName::TriangleAlert).xsmall())
-        })
-        .children(facts)
+        .child(
+            line()
+                .when(tone == Tone::Busy && !facts.is_empty(), |this| {
+                    this.child(Spinner::new().xsmall().color(style::muted(cx)))
+                })
+                .when(matches!(tone, Tone::Warning | Tone::Danger), |this| {
+                    this.child(Icon::new(IconName::TriangleAlert).xsmall())
+                })
+                .children(facts),
+        )
+        .when(!rest.is_empty(), |this| this.child(line().children(rest)))
 }
 
 fn banner(id: &'static str, text: &str, tone: Tone, cx: &App) -> Stateful<Div> {

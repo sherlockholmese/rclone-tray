@@ -10,6 +10,8 @@ pub const INSET: Pixels = px(16.);
 pub const MOUNT_ROW: Pixels = px(60.);
 /// Height of a queue row in the virtualized transfer lists.
 pub const QUEUE_ROW: Pixels = px(52.);
+/// The narrowest a mount's name gets in its row. Live facts give way before crowding it further.
+pub const NAME_MIN: Pixels = px(96.);
 /// The information-bearing progress rail along a row's lower edge.
 pub const RAIL: Pixels = px(2.);
 
