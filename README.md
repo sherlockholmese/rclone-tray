@@ -34,19 +34,21 @@ The tray menu and main window both offer mount, open folder, log, and unmount ac
 Re-launching the application opens the existing instance rather than starting duplicate mounts.
 
 The settings window is built with GPUI and shadcn-style components (gpui-component), and
-follows the desktop's light or dark appearance. It is one list of mounts. Each row's switch
-mounts or unmounts it, the folder button opens it, and the row opens its details. A spinner
-means working, and a warning sign means something needs you. Live speeds, queued uploads, and
-problems appear on the row only when there is something to report, and the row's lower edge
-fills with the progress of its active transfers. The header sums up every mount. Unknown file
-sizes are left out of that line rather than estimated.
+follows the desktop's light or dark appearance. Mounts are listed in a sidebar; the selected
+one fills the content plate beside it. A cloud icon means mounted, a struck-out cloud means
+unmounted, a spinner means working, and a cloud with a warning sign means something needs you.
+The live speed or queued uploads appear beside a mount's name only when there is something to
+report. Right-click a mount for **Open folder**, **Mount**/**Unmount…**, **Edit…**,
+**Clear cache…**, and **Remove…**. Alt+Up and Alt+Down move between mounts.
 
-Select a mount for its details: the same switch, **Open folder**, **Clear cache**, **Edit**,
-**Remove**, and **Uploads**, **Downloads**, and **Log** tabs. Clearing, editing, and removing
-need the mount to be unmounted first. Queues list file names, transferred bytes, speeds, and progress when the size is
-known, with moving files first. Waiting uploads show their size, delay, and retry attempts.
-Escape or Alt+Left returns to the list. **Refresh remotes** (F5), **Start at login**, and
-**Quit…** (Ctrl+Q) are in the window menu. Downloads are on demand: rclone exposes active downloads, not a waiting download
+The plate's title bar holds the mount's switch, **Open folder**, and a menu with **Edit…**,
+**Clear cache…**, and **Remove…**, which need the mount to be unmounted first. Below it are the
+mount's folder, remote, and cache use, then **Uploads**, **Downloads**, and **Log** tabs.
+Queues list file names, transferred bytes, speeds, and progress when the size is known, with
+moving files first; the queue's summary line and each row's lower edge fill with progress.
+Waiting uploads show their size, delay, and retry attempts. Unknown file sizes are left out
+rather than estimated. **Add mount** (Ctrl+N) and the settings menu sit at the top of the
+sidebar: **Refresh remotes** (F5), **Start at login**, theme, and **Quit…** (Ctrl+Q). Downloads are on demand: rclone exposes active downloads, not a waiting download
 queue. Missing queue data is shown as unavailable, never as an empty queue. Polling runs
 off the UI thread, roughly once per second; lists are virtualized for large queues.
 The tray tooltip and menu show the same summary, including startup recovery. Each mount's menu

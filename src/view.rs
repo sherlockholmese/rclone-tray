@@ -343,7 +343,8 @@ pub fn remote_path(profile: &Profile) -> String {
     }
 }
 
-/// Live cache use while mounted, the measured size on disk otherwise.
+/// Live cache use while mounted, the measured size on disk otherwise. Shown under a "Cache"
+/// label, so the value does not repeat the word.
 pub fn cache_line(
     profile: &Profile,
     sample: Option<&Result<Activity, String>>,
@@ -355,8 +356,8 @@ pub fn cache_line(
         _ => on_disk,
     };
     match used {
-        Some(bytes) => format!("{} of {target} GiB cache", byte_size(bytes as f64)),
-        None => format!("{target} GiB cache"),
+        Some(bytes) => format!("{} of {target} GiB", byte_size(bytes as f64)),
+        None => format!("{target} GiB"),
     }
 }
 
@@ -839,14 +840,11 @@ mod tests {
         assert_eq!(remote_path(&mount), "work:");
         mount.folder = "Reports".into();
         assert_eq!(remote_path(&mount), "work:Reports");
-        assert_eq!(cache_line(&mount, None, None), "10 GiB cache");
-        assert_eq!(
-            cache_line(&mount, None, Some(3 << 20)),
-            "3.0 MiB of 10 GiB cache"
-        );
+        assert_eq!(cache_line(&mount, None, None), "10 GiB");
+        assert_eq!(cache_line(&mount, None, Some(3 << 20)), "3.0 MiB of 10 GiB");
         assert_eq!(
             cache_line(&mount, Some(&Ok(idle())), Some(3 << 20)),
-            "0 B of 10 GiB cache"
+            "0 B of 10 GiB"
         );
     }
 

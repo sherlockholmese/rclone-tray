@@ -6,14 +6,32 @@ use rclone_tray::view::Tone;
 
 /// Horizontal inset shared by headers, rows, tabs, and panes: one strong left edge.
 pub const INSET: Pixels = px(16.);
-/// Height of a mount row. Fixed, so status changes never move neighbouring rows.
-pub const MOUNT_ROW: Pixels = px(60.);
+/// Width of the mount sidebar, shared by its title-bar segment so the two read as one column.
+pub const SIDEBAR: Pixels = px(224.);
+/// Left edge of the sidebar's icons. The wordmark above them starts on the same line.
+pub const SIDEBAR_INSET: Pixels = px(20.);
 /// Height of a queue row in the virtualized transfer lists.
 pub const QUEUE_ROW: Pixels = px(52.);
-/// The narrowest a mount's name gets in its row. Live facts give way before crowding it further.
-pub const NAME_MIN: Pixels = px(96.);
+/// Space between the window edge and the lifted content plate.
+pub const PLATE_GAP: Pixels = px(8.);
 /// The information-bearing progress rail along a row's lower edge.
 pub const RAIL: Pixels = px(2.);
+
+/// The window behind the content plate. The sidebar sits directly on it.
+pub fn canvas(cx: &App) -> Hsla {
+    cx.theme().sidebar
+}
+
+/// The lifted content plate. In light mode white on the off-white canvas, carried by its
+/// shadow. In dark mode shadows vanish, so the plate steps up in lightness instead.
+pub fn plate(cx: &App) -> Hsla {
+    let theme = cx.theme();
+    if theme.is_dark() {
+        theme.background.blend(theme.foreground.opacity(0.04))
+    } else {
+        theme.background
+    }
+}
 
 pub fn muted(cx: &App) -> Hsla {
     cx.theme().muted_foreground
@@ -21,10 +39,6 @@ pub fn muted(cx: &App) -> Hsla {
 
 pub fn rule(cx: &App) -> Hsla {
     cx.theme().border
-}
-
-pub fn hover(cx: &App) -> Hsla {
-    cx.theme().list_hover
 }
 
 pub fn rail(cx: &App) -> Hsla {

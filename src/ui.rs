@@ -1,21 +1,22 @@
-//! The settings window: one ledger of mounts, and a detail page per mount.
+//! The settings window: mounts in a sidebar, the selected one in the content pane.
 use crate::{editor::Editor, style};
 use gio::prelude::*;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
-    ThemeMode, TitleBar, WindowExt as _,
+    ActiveTheme as _, Collapsible, Disableable as _, Icon, IconName, InteractiveElementExt as _,
+    Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT, Theme, ThemeMode, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::{DialogButtonProps, DialogFooter},
     h_flex,
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
     scroll::{ScrollableElement as _, ScrollbarMode},
+    sidebar::{Sidebar, SidebarItem},
     spinner::Spinner,
     switch::Switch,
     tab::{Tab, TabBar},
     v_flex,
 };
-use gpui_kit::{prelude::*, *};
+use gpui_kit::{assets::IconName as AssetIcon, prelude::*, *};
 use rclone_tray::{
     backend::{self, Event, Request, Snapshot, Status},
     config::{Config, Paths, Profile},
@@ -33,7 +34,10 @@ use std::{
 };
 
 pub const CONTEXT: &str = "RcloneTray";
-gpui_kit::actions!(rclone_tray, [AddMount, Refresh, Quit, Back]);
+gpui_kit::actions!(
+    rclone_tray,
+    [AddMount, Refresh, Quit, SelectPrevious, SelectNext]
+);
 
 enum Link {
     Connected(Sender<Request>, Receiver<Event>),
@@ -115,12 +119,12 @@ pub struct Shell {
     link: Link,
     incoming: Option<Receiver<String>>,
     _guard: Option<InstanceGuard>,
-    detail: Option<u64>,
+    /// The mount shown in the content pane. Always one while any mount exists.
+    selected: Option<u64>,
     pane: Pane,
     notice: Option<String>,
     log: SharedString,
     log_scroll: ScrollHandle,
-    list_scroll: ScrollHandle,
     queue_scroll: UniformListScrollHandle,
     focus: FocusHandle,
     autostart: bool,
@@ -130,6 +134,8 @@ pub struct Shell {
     /// Upload batch of each active mount, for overall progress that survives finished files.
     batches: HashMap<u64, view::UploadBatch>,
     clearing: Option<u64>,
+    /// A press on the sidebar header that becomes a window move once the pointer moves.
+    drag_armed: bool,
     editor: Option<WeakEntity<Editor>>,
     _appearance: Subscription,
 }
@@ -164,8 +170,9 @@ pub fn open(
     action: Action,
 ) {
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(640.), px(520.)), cx)),
-        window_min_size: Some(size(px(420.), px(360.))),
+        window_bounds: Some(WindowBounds::centered(size(px(840.), px(560.)), cx)),
+        // The sidebar plus a content pane that still fits a mount's title-bar actions.
+        window_min_size: Some(size(px(600.), px(360.))),
         window_decorations: Some(WindowDecorations::Client),
         app_id: Some("io.github.rclone_tray.Settings".into()),
         titlebar: Some(TitlebarOptions {
@@ -227,20 +234,21 @@ impl Shell {
             link,
             incoming,
             _guard: guard,
-            detail: None,
+            selected: None,
             pane: Pane::Uploads,
             notice: None,
             log: SharedString::default(),
             log_scroll: ScrollHandle::new(),
-            list_scroll: ScrollHandle::new(),
             queue_scroll: UniformListScrollHandle::new(),
             focus,
             usage: HashMap::new(),
             batches: HashMap::new(),
             clearing: None,
+            drag_armed: false,
             editor: None,
             _appearance: appearance,
         };
+        shell.reconcile_selection(window, cx);
         shell.handle(action, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -298,13 +306,8 @@ impl Shell {
     }
 
     fn apply(&mut self, snapshot: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.detail
-            && !snapshot.config.profiles.iter().any(|p| p.id == id)
-        {
-            self.detail = None;
-        }
         // A mount that just stopped has a cache worth measuring again.
-        if let Some(id) = self.detail
+        if let Some(id) = self.selected
             && self.status(id).active()
             && !snapshot.statuses.get(&id).is_some_and(Status::active)
         {
@@ -327,7 +330,36 @@ impl Shell {
                 self.batches.entry(*id).or_default().observe(activity);
             }
         }
+        self.reconcile_selection(window, cx);
         cx.notify();
+    }
+
+    /// Keeps a mount selected while any exist: the current one, or the first after a removal.
+    fn reconcile_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let profiles = &self.state.config.profiles;
+        let kept = self
+            .selected
+            .filter(|id| profiles.iter().any(|p| p.id == *id));
+        let next = kept.or_else(|| profiles.first().map(|p| p.id));
+        if next != self.selected {
+            self.selected = None;
+            if let Some(id) = next {
+                self.select(id, None, window, cx);
+            }
+        }
+    }
+
+    fn step_selection(&mut self, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let profiles = &self.state.config.profiles;
+        let Some(index) = self
+            .selected
+            .and_then(|id| profiles.iter().position(|p| p.id == id))
+        else {
+            return;
+        };
+        let target = index.saturating_add_signed(offset).min(profiles.len() - 1);
+        let id = profiles[target].id;
+        self.select(id, None, window, cx);
     }
 
     fn send(&mut self, request: Request, cx: &mut Context<Self>) {
@@ -361,11 +393,11 @@ impl Shell {
             Action::Open(id) => self.open_folder(id, cx),
             Action::Queue(id) => {
                 window.activate_window();
-                self.open_detail(id, Pane::Uploads, window, cx);
+                self.select(id, Some(Pane::Uploads), window, cx);
             }
             Action::Log(id) => {
                 window.activate_window();
-                self.open_detail(id, Pane::Log, window, cx);
+                self.select(id, Some(Pane::Log), window, cx);
             }
             Action::Quit => {
                 window.activate_window();
@@ -375,13 +407,21 @@ impl Shell {
         }
     }
 
-    fn open_detail(&mut self, id: u64, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shows a mount. Without a `pane`, the open tab carries over, so you can compare mounts.
+    fn select(&mut self, id: u64, pane: Option<Pane>, window: &mut Window, cx: &mut Context<Self>) {
         if self.profile(id).is_none() {
             return;
         }
-        self.detail = Some(id);
-        self.measure(id, cx);
-        self.select_pane(pane, window, cx);
+        let changed = self.selected != Some(id);
+        self.selected = Some(id);
+        if changed {
+            self.measure(id, cx);
+            self.queue_scroll = UniformListScrollHandle::new();
+        }
+        let pane = pane.unwrap_or(self.pane);
+        if changed || pane != self.pane {
+            self.select_pane(pane, window, cx);
+        }
         cx.notify();
     }
 
@@ -394,7 +434,7 @@ impl Shell {
     }
 
     fn load_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.detail else { return };
+        let Some(id) = self.selected else { return };
         self.log = read_log(&self.paths, id).into();
         // The newest lines are the useful ones. Reveal them once the text is laid out.
         cx.on_next_frame(window, |this, _, cx| {
@@ -614,7 +654,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn start_backend(&mut self, cx: &mut Context<Self>) {
+    fn start_backend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Link::Offline { starting, .. } = &mut self.link else {
             return;
         };
@@ -640,14 +680,15 @@ impl Shell {
             }
             Err(last)
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(state) => {
                         let (requests, events) = ipc::connect(ipc::socket_path(&this.paths));
                         this.link = Link::Connected(requests, events);
                         this.state = state;
+                        this.reconcile_selection(window, cx);
                     }
                     Err(error) => {
                         this.link = Link::Offline {
@@ -678,13 +719,12 @@ impl Shell {
         self.quit(window, cx);
     }
 
-    fn on_back(&mut self, _: &Back, window: &mut Window, cx: &mut Context<Self>) {
-        if self.detail.take().is_some() {
-            window.focus(&self.focus, cx);
-            cx.notify();
-        } else {
-            cx.propagate();
-        }
+    fn on_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_selection(-1, window, cx);
+    }
+
+    fn on_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_selection(1, window, cx);
     }
 }
 
@@ -692,66 +732,150 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = match (&self.link, self.detail) {
+        let body = match (&self.link, self.selected) {
             (Link::Offline { error, starting }, _) => self
                 .render_offline(error.clone(), *starting, cx)
                 .into_any_element(),
-            (_, Some(id)) => self.render_detail(id, window, cx).into_any_element(),
-            (_, None) => self.render_list(cx).into_any_element(),
+            (_, Some(id)) => self.render_mount(id, window, cx).into_any_element(),
+            (_, None) => self.render_empty(cx).into_any_element(),
         };
-        v_flex()
+        let plate = v_flex()
+            .size_full()
+            .overflow_hidden()
+            .bg(style::plate(cx))
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(style::rule(cx))
+            .shadow_md()
+            .child(self.render_title_bar(cx))
+            .children(self.render_banners(cx))
+            .child(body);
+        h_flex()
             .id("shell")
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_add))
             .on_action(cx.listener(Self::on_refresh))
             .on_action(cx.listener(Self::on_quit))
-            .on_action(cx.listener(Self::on_back))
+            .on_action(cx.listener(Self::on_previous))
+            .on_action(cx.listener(Self::on_next))
             .size_full()
-            .bg(cx.theme().background)
+            .bg(style::canvas(cx))
             .text_color(cx.theme().foreground)
-            .child(self.render_title_bar(cx))
-            .children(self.render_banners(cx))
-            .child(body)
+            .child(self.render_sidebar(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .py(style::PLATE_GAP)
+                    .pr(style::PLATE_GAP)
+                    .child(plate),
+            )
+    }
+}
+
+/// What the menus of one mount may offer right now.
+#[derive(Clone, Copy)]
+struct MountMenu {
+    id: u64,
+    active: bool,
+    mounted: bool,
+    /// The switch's state cannot change: unmounting, mounted elsewhere, or quitting.
+    locked: bool,
+    cancel: bool,
+    quitting: bool,
+    cache_empty: bool,
+    clearing: bool,
+}
+
+impl MountMenu {
+    /// `full` adds the actions the content pane already shows, for the sidebar's context menu.
+    fn build(self, menu: PopupMenu, this: WeakEntity<Shell>, full: bool) -> PopupMenu {
+        let id = self.id;
+        let changeable = !self.active && !self.quitting;
+        let mut menu = menu;
+        if full {
+            let (open, toggle) = (this.clone(), this.clone());
+            let active = self.active;
+            menu = menu
+                .item(
+                    PopupMenuItem::new("Open folder")
+                        .disabled(!self.mounted)
+                        .on_click(move |_, _, cx| {
+                            let _ = open.update(cx, |this, cx| this.open_folder(id, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(match (active, self.cancel) {
+                        (false, _) => "Mount",
+                        (true, true) => "Stop mounting…",
+                        (true, false) => "Unmount…",
+                    })
+                    .disabled(self.locked)
+                    .on_click(move |_, window, cx| {
+                        let _ = toggle.update(cx, |this, cx| this.toggle(id, !active, window, cx));
+                    }),
+                )
+                .separator();
+        } else if self.active {
+            menu = menu.label("Unmount to change");
+        }
+        let (edit, clear, remove) = (this.clone(), this.clone(), this);
+        menu.item(PopupMenuItem::new("Edit…").disabled(!changeable).on_click(
+            move |_, window, cx| {
+                let _ = edit.update(cx, |this, cx| {
+                    let profile = this.profile(id).cloned();
+                    if profile.is_some() {
+                        this.edit(profile, window, cx);
+                    }
+                });
+            },
+        ))
+        .item(
+            PopupMenuItem::new("Clear cache…")
+                .disabled(!changeable || self.cache_empty || self.clearing)
+                .on_click(move |_, window, cx| {
+                    let _ = clear.update(cx, |this, cx| this.confirm_clear(id, window, cx));
+                }),
+        )
+        .item(
+            PopupMenuItem::new("Remove…")
+                .disabled(!changeable)
+                .on_click(move |_, window, cx| {
+                    let _ = remove.update(cx, |this, cx| this.confirm_remove(id, window, cx));
+                }),
+        )
     }
 }
 
 impl Shell {
-    fn render_title_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn mount_menu(&self, id: u64) -> MountMenu {
+        let status = self.status(id);
+        MountMenu {
+            id,
+            active: status.active(),
+            mounted: view::primary(status) == Primary::Open,
+            locked: matches!(status, Status::Unmounting | Status::External) || self.state.quitting,
+            cancel: view::primary(status) == Primary::Cancel,
+            quitting: self.state.quitting,
+            cache_empty: self.usage.get(&id) == Some(&0),
+            clearing: self.clearing.is_some(),
+        }
+    }
+
+    /// The sidebar's header: app-wide actions. It drags the window like a title bar does.
+    fn render_sidebar_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = matches!(self.link, Link::Connected(..));
-        let lead = match self.detail.and_then(|id| self.profile(id)) {
-            Some(profile) => h_flex()
-                .gap_1()
-                .min_w_0()
-                .child(
-                    Button::new("back")
-                        .ghost()
-                        .small()
-                        .icon(IconName::ArrowLeft)
-                        .tooltip("All mounts")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.on_back(&Back, window, cx)),
-                        ),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .font_semibold()
-                        .child(profile.name.clone()),
-                ),
-            None => h_flex().text_sm().font_semibold().child("Rclone Tray"),
-        };
         let this = cx.entity().downgrade();
         let autostart = self.autostart;
         let current = self.theme;
-        let menu = Button::new("menu")
+        let settings = Button::new("settings")
             .ghost()
             .small()
-            .icon(IconName::Ellipsis)
-            .tooltip("More")
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+            .icon(IconName::Settings)
+            .tooltip("Settings")
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
                 let (refresh, login, quit) = (this.clone(), this.clone(), this.clone());
                 let mut menu = menu
                     .item(
@@ -785,29 +909,172 @@ impl Shell {
                         let _ = quit.update(cx, |this, cx| this.quit(window, cx));
                     }))
             });
-        let add = (self.detail.is_none() && connected && !self.state.config.profiles.is_empty())
-            .then(|| {
-                Button::new("add")
-                    .outline()
-                    .small()
-                    .icon(IconName::Plus)
-                    .label("Add mount")
-                    .disabled(self.state.quitting)
-                    .tooltip("Ctrl+N")
-                    .on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx)))
-            });
-        TitleBar::new()
-            .bg(cx.theme().background)
-            .border_color(style::rule(cx))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .justify_between()
-                    .pr_2()
-                    .child(lead)
-                    .child(h_flex().gap_1().children(add).child(menu)),
+        let add = Button::new("add")
+            .ghost()
+            .small()
+            .icon(IconName::Plus)
+            .tooltip("Add mount (Ctrl+N)")
+            .disabled(!connected || self.state.quitting)
+            .on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx)));
+        // Sits level with the plate's title bar, which starts one plate gap down.
+        h_flex()
+            .id("sidebar-header")
+            .flex_shrink_0()
+            .h(TITLE_BAR_HEIGHT + style::PLATE_GAP)
+            .pt(style::PLATE_GAP)
+            .pl(style::SIDEBAR_INSET)
+            .pr_2()
+            .justify_between()
+            .window_control_area(WindowControlArea::Drag)
+            .on_double_click(|_, window, _| window.zoom_window())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drag_armed = true),
             )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drag_armed = false),
+            )
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if std::mem::take(&mut this.drag_armed) {
+                    window.start_window_move();
+                }
+            }))
+            .child(div().text_sm().font_semibold().child("Rclone Tray"))
+            .child(h_flex().gap_1().child(add).child(settings))
+    }
+
+    /// The plate's title bar: the selected mount, its switch, and its actions.
+    fn render_title_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let connected = matches!(self.link, Link::Connected(..));
+        let selected = self
+            .selected
+            .filter(|_| connected)
+            .and_then(|id| self.profile(id).cloned());
+        let content = selected.map(|profile| {
+            let id = profile.id;
+            let status = self.status(id).clone();
+            let menu = self.mount_menu(id);
+            let shell = cx.entity().downgrade();
+            let busy = matches!(
+                status,
+                Status::Mounting | Status::Recovering | Status::Unmounting
+            );
+            let switch = self.mount_switch(id, &status, &profile.name, self.state.quitting, cx);
+            let muted = style::muted(cx);
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .gap_3()
+                .justify_between()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .font_semibold()
+                        .child(profile.name.clone()),
+                )
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap_2()
+                        .when(busy, |this| {
+                            this.child(Spinner::new().xsmall().color(muted))
+                        })
+                        .child(switch.mr_2())
+                        .child(
+                            Button::new("open")
+                                .outline()
+                                .small()
+                                .icon(IconName::FolderOpen)
+                                .label("Open folder")
+                                .disabled(!menu.mounted)
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.open_folder(id, cx)),
+                                ),
+                        )
+                        .child(
+                            Button::new("mount-menu")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Ellipsis)
+                                .tooltip("More")
+                                .dropdown_menu_with_anchor(Anchor::TopRight, move |m, _, _| {
+                                    menu.build(m, shell.clone(), false)
+                                }),
+                        ),
+                )
+        });
+        TitleBar::new()
+            .pl(style::INSET)
+            .pr_1()
+            .border_b_0()
+            .bg(transparent_black())
+            .children(content)
+    }
+
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let items: Vec<_> = self
+            .state
+            .config
+            .profiles
+            .clone()
+            .into_iter()
+            .map(|profile| self.sidebar_item(profile, cx))
+            .collect();
+        v_flex()
+            .flex_shrink_0()
+            .w(style::SIDEBAR)
+            .h_full()
+            .child(self.render_sidebar_header(cx))
+            .child(
+                div().flex_1().min_h_0().child(
+                    Sidebar::new("mounts")
+                        .collapsible(false)
+                        .w_full()
+                        .border_r_0()
+                        .children(items),
+                ),
+            )
+    }
+
+    /// A mount in the sidebar. The icon says whether it is mounted or needs you; the suffix
+    /// carries the one live fact worth a glance.
+    fn sidebar_item(&mut self, profile: Profile, cx: &mut Context<Self>) -> MountItem {
+        let id = profile.id;
+        let status = self.status(id).clone();
+        let sample = self.state.activity.get(&id);
+        let batch = self.batches.get(&id);
+        let (now, rest, tone) = view::ledger_lines(&status, sample, batch);
+        let icon = match (tone, status.active()) {
+            (Tone::Warning | Tone::Danger, _) => {
+                Icon::new(AssetIcon::CloudAlert).text_color(style::tone(tone, cx))
+            }
+            (_, true) => Icon::new(AssetIcon::Cloud),
+            (_, false) => Icon::new(AssetIcon::CloudOff).text_color(style::muted(cx)),
+        };
+        let note = (status == Status::Mounted && tone == Tone::Ok)
+            .then(|| now.into_iter().next().or_else(|| rest.into_iter().next()))
+            .flatten();
+        let menu = self.mount_menu(id);
+        let this = cx.entity().downgrade();
+        MountItem {
+            name: profile.name.into(),
+            icon,
+            muted: !status.active(),
+            selected: self.selected == Some(id),
+            suffix: match note {
+                _ if tone == Tone::Busy => Suffix::Busy,
+                Some(note) => Suffix::Note(note.into()),
+                None => Suffix::None,
+            },
+            on_click: Rc::new(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.select(id, None, window, cx)
+            })),
+            menu: Rc::new(move |m, _, _| menu.build(m, this.clone(), true)),
+        }
     }
 
     fn render_banners(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -914,71 +1181,8 @@ impl Shell {
                     .label("Start Rclone Tray")
                     .loading(starting)
                     .disabled(starting)
-                    .on_click(cx.listener(|this, _, _, cx| this.start_backend(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.start_backend(window, cx))),
             )
-    }
-
-    fn render_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.state.config.profiles.is_empty() {
-            return self.render_empty(cx).into_any_element();
-        }
-        let mut overview = view::overview(&self.state);
-        if self.state.quitting {
-            // The banner above owns quit progress.
-            overview.facts.clear();
-        }
-        let attention = overview
-            .facts
-            .first()
-            .is_some_and(|fact| fact.ends_with("attention"));
-        let header = h_flex()
-            .px(style::INSET)
-            .pt_4()
-            .pb_2()
-            .gap_x_3()
-            .flex_wrap()
-            .whitespace_nowrap()
-            .items_baseline()
-            .child(div().text_lg().font_semibold().child(overview.headline))
-            .children(overview.facts.into_iter().map(|fact| {
-                div()
-                    .text_sm()
-                    .text_color(if attention {
-                        cx.theme().danger
-                    } else {
-                        style::muted(cx)
-                    })
-                    .child(fact)
-            }));
-        let rows: Vec<_> = self
-            .state
-            .config
-            .profiles
-            .clone()
-            .into_iter()
-            .map(|profile| self.render_row(profile, cx).into_any_element())
-            .collect();
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .child(header)
-            .child(
-                v_flex()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .id("mounts")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.list_scroll)
-                            .children(rows),
-                    )
-                    .vertical_scrollbar(&self.list_scroll),
-            )
-            .into_any_element()
     }
 
     fn render_empty(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1036,76 +1240,6 @@ impl Shell {
             )
     }
 
-    fn render_row(&mut self, profile: Profile, cx: &mut Context<Self>) -> impl IntoElement {
-        let id = profile.id;
-        let status = self.status(id).clone();
-        let sample = self.state.activity.get(&id);
-        let batch = self.batches.get(&id);
-        let (now, rest, tone) = view::ledger_lines(&status, sample, batch);
-        let progress = batch.and_then(view::UploadBatch::progress);
-        let primary = view::primary(&status);
-        let quitting = self.state.quitting;
-        let row_id = SharedString::from(format!("mount-{id}"));
-        div()
-            .id(row_id.clone())
-            .relative()
-            .h(style::MOUNT_ROW)
-            .flex()
-            .items_center()
-            .gap_3()
-            .px(style::INSET)
-            .border_b_1()
-            .border_color(style::rule(cx))
-            .cursor_pointer()
-            .hover(|this| this.bg(style::hover(cx)))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_detail(id, Pane::Uploads, window, cx)
-            }))
-            .child(controls().child(self.mount_switch(id, &status, &profile.name, quitting, cx)))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w(style::NAME_MIN)
-                    .child(
-                        div()
-                            .truncate()
-                            .text_sm()
-                            .font_medium()
-                            .when(!status.active(), |this| this.text_color(style::muted(cx)))
-                            .child(profile.name.clone()),
-                    )
-                    .child(
-                        style::path(div())
-                            .text_xs()
-                            .text_color(style::muted(cx))
-                            .child(view::short_path(&profile.mountpoint, self.home.as_deref())),
-                    ),
-            )
-            .child(status_note(now, rest, tone, cx))
-            .child(
-                controls().child(
-                    Button::new(SharedString::from(format!("open-{id}")))
-                        .ghost()
-                        .small()
-                        .icon(IconName::FolderOpen)
-                        .tooltip("Open folder")
-                        .disabled(primary != Primary::Open)
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_folder(id, cx))),
-                ),
-            )
-            .child(
-                Button::new(SharedString::from(format!("details-{id}")))
-                    .ghost()
-                    .small()
-                    .icon(IconName::ChevronRight)
-                    .tooltip("Details")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_detail(id, Pane::Uploads, window, cx)
-                    })),
-            )
-            .children(progress.map(|fraction| progress_rail(fraction, cx)))
-    }
-
     fn mount_switch(
         &self,
         id: u64,
@@ -1113,7 +1247,7 @@ impl Shell {
         name: &str,
         quitting: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Switch {
         let locked = matches!(status, Status::Unmounting | Status::External) || quitting;
         let tooltip = match status {
             Status::External => "Mounted by another session".to_string(),
@@ -1122,7 +1256,10 @@ impl Shell {
             _ if status.active() => format!("Unmount {name}"),
             _ => format!("Mount {name}"),
         };
+        // The label names the state the switch is in, so the toggle never stands alone.
         Switch::new(SharedString::from(format!("switch-{id}")))
+            .label(status.label().to_string())
+            .small()
             .checked(status.active())
             .disabled(locked)
             .tooltip(tooltip.clone())
@@ -1132,7 +1269,8 @@ impl Shell {
             )
     }
 
-    fn render_detail(
+    /// The selected mount: its switch and where it lives, then its queues and log.
+    fn render_mount(
         &mut self,
         id: u64,
         window: &mut Window,
@@ -1147,125 +1285,24 @@ impl Shell {
         let problem = view::cache_warning(sample)
             .or(view::status_hint(&status))
             .map(str::to_string);
-        let mounted = view::primary(&status) == Primary::Open;
-        let active = status.active();
-        let busy = matches!(
-            status,
-            Status::Mounting | Status::Recovering | Status::Unmounting
-        );
-        let quitting = self.state.quitting;
         let queues = view::queues(&self.state, id);
+        let cache = if self.clearing == Some(id) {
+            "Clearing…".to_string()
+        } else {
+            view::cache_line(&profile, sample, self.usage.get(&id).copied())
+        };
 
-        let identity = h_flex()
-            .gap_4()
-            .items_center()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        style::path(div())
-                            .text_lg()
-                            .font_semibold()
-                            .child(view::short_path(&profile.mountpoint, self.home.as_deref())),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .text_sm()
-                            .text_color(style::muted(cx))
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .child(
-                                        div().flex_shrink_0().child(format!("{}:", profile.remote)),
-                                    )
-                                    .child(
-                                        style::path(div()).min_w_0().child(profile.folder.clone()),
-                                    ),
-                            )
-                            .child(div().flex_shrink_0().child(view::cache_line(
-                                &profile,
-                                sample,
-                                self.usage.get(&id).copied(),
-                            ))),
-                    ),
-            )
-            .child(
-                Button::new("open")
-                    .primary()
-                    .icon(IconName::FolderOpen)
-                    .label("Open folder")
-                    .disabled(!mounted)
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_folder(id, cx))),
-            );
-
-        let controls = h_flex()
-            .gap_2()
-            .items_center()
-            .child(self.mount_switch(id, &status, &profile.name, quitting, cx))
-            .child(div().text_sm().child(status.label().to_string()))
-            .when(busy, |this| {
-                this.child(Spinner::new().small().color(style::muted(cx)))
-            })
-            .child(div().flex_1())
-            .child(
-                Button::new("clear-cache")
-                    .ghost()
-                    .small()
-                    .label("Clear cache")
-                    .loading(self.clearing == Some(id))
-                    .disabled(
-                        active
-                            || quitting
-                            || self.clearing.is_some()
-                            || self.usage.get(&id) == Some(&0),
-                    )
-                    .tooltip(if active {
-                        "Unmount to clear cache"
-                    } else if self.usage.get(&id) == Some(&0) {
-                        "Cache is empty"
-                    } else {
-                        "Delete local copies"
-                    })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.confirm_clear(id, window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("edit")
-                    .ghost()
-                    .small()
-                    .label("Edit")
-                    .disabled(active || quitting)
-                    .tooltip(if active {
-                        "Unmount to edit"
-                    } else {
-                        "Edit mount"
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let profile = this.profile(id).cloned();
-                        if profile.is_some() {
-                            this.edit(profile, window, cx);
-                        }
-                    })),
-            )
-            .child(
-                Button::new("remove")
-                    .ghost()
-                    .small()
-                    .label("Remove")
-                    .disabled(active || quitting)
-                    .tooltip(if active {
-                        "Unmount to remove"
-                    } else {
-                        "Remove mount"
-                    })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.confirm_remove(id, window, cx)),
-                    ),
-            );
+        let summary = h_flex()
+            .gap_8()
+            .items_start()
+            .child(fact(
+                "Folder",
+                view::short_path(&profile.mountpoint, self.home.as_deref()),
+                true,
+                cx,
+            ))
+            .child(fact("Remote", view::remote_path(&profile), true, cx))
+            .child(fact("Cache", cache, false, cx));
 
         let count = |pane: &view::QueuePane| (!pane.rows.is_empty()).then_some(pane.rows.len());
         let tab = |label: &'static str, count: Option<usize>, cx: &App| {
@@ -1326,8 +1363,8 @@ impl Shell {
             .child(
                 v_flex()
                     .px(style::INSET)
-                    .pt_4()
-                    .pb_3()
+                    .pt_1()
+                    .pb_4()
                     .gap_3()
                     .when_some(problem, |this, problem| {
                         this.child(
@@ -1347,8 +1384,7 @@ impl Shell {
                                 .child(div().flex_1().min_w_0().child(problem)),
                         )
                     })
-                    .child(identity)
-                    .child(controls),
+                    .child(summary),
             )
             .child(tabs)
             .child(pane)
@@ -1440,7 +1476,7 @@ impl Shell {
 
     fn render_log(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let text = if self.log.is_empty() {
-            SharedString::from("No log yet. It appears after the first mount attempt.")
+            SharedString::from("No log yet")
         } else {
             self.log.clone()
         };
@@ -1468,12 +1504,6 @@ impl Shell {
     }
 }
 
-/// Holds controls inside a clickable row. A press here belongs to the control, so it never
-/// also opens the row's details.
-fn controls() -> Div {
-    h_flex().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-}
-
 fn queue_row(row: view::QueueRow, cx: &App) -> impl IntoElement {
     div()
         .relative()
@@ -1499,6 +1529,16 @@ fn queue_row(row: view::QueueRow, cx: &App) -> impl IntoElement {
         })
 }
 
+/// A labelled fact about the selected mount. Paths give way first, keeping their end visible.
+fn fact(label: &'static str, value: String, path: bool, cx: &App) -> impl IntoElement {
+    v_flex()
+        .gap_0p5()
+        .when(path, |this| this.min_w_0())
+        .when(!path, |this| this.flex_shrink_0())
+        .child(div().text_xs().text_color(style::muted(cx)).child(label))
+        .child(style::path(div()).text_sm().child(value))
+}
+
 /// The row's lower edge fills with the progress of its transfers.
 fn progress_rail(fraction: f64, cx: &App) -> impl IntoElement {
     div()
@@ -1508,32 +1548,6 @@ fn progress_rail(fraction: f64, cx: &App) -> impl IntoElement {
         .h(style::RAIL)
         .w(relative(fraction as f32))
         .bg(style::rail(cx))
-}
-
-/// Live state beside a mount: a spinner while it works, an icon when it needs a decision.
-/// Live state beside a mount, right-aligned in up to two lines that sit beside its name and
-/// path. It gives way to the name, which keeps at least `style::NAME_MIN`.
-fn status_note(facts: Vec<String>, rest: Vec<String>, tone: Tone, cx: &App) -> impl IntoElement {
-    let line = || h_flex().justify_end().gap_3();
-    v_flex()
-        .min_w_0()
-        .overflow_hidden()
-        .items_end()
-        .gap_0p5()
-        .whitespace_nowrap()
-        .text_xs()
-        .text_color(style::tone(tone, cx))
-        .child(
-            line()
-                .when(tone == Tone::Busy && !facts.is_empty(), |this| {
-                    this.child(Spinner::new().xsmall().color(style::muted(cx)))
-                })
-                .when(matches!(tone, Tone::Warning | Tone::Danger), |this| {
-                    this.child(Icon::new(IconName::TriangleAlert).xsmall())
-                })
-                .children(facts),
-        )
-        .when(!rest.is_empty(), |this| this.child(line().children(rest)))
 }
 
 fn banner(id: &'static str, text: &str, tone: Tone, cx: &App) -> Stateful<Div> {
@@ -1555,6 +1569,92 @@ fn banner(id: &'static str, text: &str, tone: Tone, cx: &App) -> Stateful<Div> {
                 .into_any_element(),
         })
         .child(div().flex_1().min_w_0().child(text.to_string()))
+}
+
+#[derive(Clone)]
+enum Suffix {
+    None,
+    Busy,
+    Note(SharedString),
+}
+
+type ClickHandler = dyn Fn(&ClickEvent, &mut Window, &mut App);
+type MenuBuilder = dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu;
+
+/// A mount in the sidebar, drawn like a shadcn sidebar menu button. Its own item rather than
+/// `SidebarMenuItem`, so a long name truncates with an ellipsis instead of wrapping out of view.
+#[derive(Clone)]
+struct MountItem {
+    name: SharedString,
+    icon: Icon,
+    /// Unmounted: the name steps back, the icon's shape says why.
+    muted: bool,
+    selected: bool,
+    suffix: Suffix,
+    on_click: Rc<ClickHandler>,
+    menu: Rc<MenuBuilder>,
+}
+
+impl Collapsible for MountItem {
+    fn collapsed(self, _: bool) -> Self {
+        self
+    }
+
+    fn is_collapsed(&self) -> bool {
+        false
+    }
+}
+
+impl SidebarItem for MountItem {
+    fn render(self, id: impl Into<ElementId>, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme();
+        let (accent, accent_text, muted) = (
+            theme.sidebar_accent,
+            theme.sidebar_accent_foreground,
+            theme.muted_foreground,
+        );
+        let (click, menu) = (self.on_click, self.menu);
+        div().py_0p5().child(
+            h_flex()
+                .id(id.into())
+                .h_8()
+                .px_2()
+                .gap_2()
+                .rounded(theme.radius)
+                .text_sm()
+                .cursor_pointer()
+                .map(|this| {
+                    if self.selected {
+                        this.font_medium().bg(accent).text_color(accent_text)
+                    } else {
+                        this.hover(move |this| this.bg(accent.opacity(0.8)))
+                    }
+                })
+                .child(self.icon.flex_shrink_0())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .when(self.muted, |this| this.text_color(muted))
+                        .child(self.name),
+                )
+                .map(|this| match self.suffix {
+                    Suffix::None => this,
+                    Suffix::Busy => this.child(Spinner::new().xsmall().color(muted)),
+                    Suffix::Note(note) => this.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .font_normal()
+                            .text_color(muted)
+                            .child(note),
+                    ),
+                })
+                .on_click(move |event, window, cx| click(event, window, cx))
+                .context_menu(move |m, window, cx| menu(m, window, cx)),
+        )
+    }
 }
 
 struct Confirm {
