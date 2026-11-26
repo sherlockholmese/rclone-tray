@@ -1,5 +1,5 @@
 pkgname=rclone-tray
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Tray application for mounting configured rclone remotes, with a GPUI settings window'
 arch=('x86_64' 'aarch64')
