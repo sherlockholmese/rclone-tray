@@ -1,5 +1,5 @@
 //! Add and edit a mount. One dialog, one field anatomy: label, control, then inline errors.
-use crate::style;
+use crate::{motion, style};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, IndexPath, Sizable as _, StyledExt as _,
     WindowExt as _,
@@ -69,7 +69,8 @@ impl Editor {
             let (submit, enter) = (view.clone(), view.clone());
             dialog
                 .title(title)
-                .w(px(480.))
+                .entrance(motion::DIALOG)
+                .w(style::EDITOR)
                 .child(view.clone())
                 .button_props(DialogButtonProps::default().on_ok(move |_, window, cx| {
                     enter.update(cx, |editor, cx| editor.save(window, cx));
@@ -320,7 +321,9 @@ fn field(label: &'static str, control: impl IntoElement) -> Div {
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let no_remotes = self.choices.is_empty();
+        // The title stands apart from the fields more than the fields from each other.
         v_flex()
+            .pt_2()
             .gap_4()
             .pb_1()
             .when_some(self.error.clone(), |this, error| {
@@ -334,7 +337,7 @@ impl Render for Editor {
                             gpui_kit::component::Icon::new(IconName::CircleAlert)
                                 .small()
                                 .flex_shrink_0()
-                                .mt(px(2.)),
+                                .mt(style::ICON_BASELINE),
                         )
                         .child(div().flex_1().child(error)),
                 )
@@ -342,20 +345,31 @@ impl Render for Editor {
             .child(field("Name", Input::new(&self.name).disabled(self.saving)))
             .child(field(
                 "Remote",
-                if no_remotes {
-                    div()
-                        .text_sm()
-                        .text_color(style::muted(cx))
-                        .child(
-                            "No remotes found. Add one with rclone config, then refresh remotes.",
-                        )
-                        .into_any_element()
-                } else {
-                    Select::new(&self.remote)
-                        .placeholder("Choose a remote")
-                        .disabled(self.saving)
-                        .into_any_element()
-                },
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(if no_remotes {
+                        div()
+                            .text_sm()
+                            .text_color(style::muted(cx))
+                            .child("No remotes. Add one with rclone config, then refresh.")
+                            .into_any_element()
+                    } else {
+                        Select::new(&self.remote)
+                            .placeholder("Choose a remote")
+                            .disabled(self.saving)
+                            .into_any_element()
+                    }))
+                    // Remotes added with rclone config while this dialog is open.
+                    .child(
+                        Button::new("refresh-remotes")
+                            .outline()
+                            .icon(IconName::RefreshCw)
+                            .tooltip("Refresh remotes")
+                            .disabled(self.saving)
+                            .on_click(cx.listener(|this, _, _, _| {
+                                let _ = this.requests.send(Request::Refresh);
+                            })),
+                    ),
             ))
             .child(field(
                 "Remote folder",

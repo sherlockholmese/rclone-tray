@@ -1,10 +1,11 @@
 //! The settings window: mounts in a sidebar, the selected one in the content pane.
-use crate::{editor::Editor, style};
+use crate::{editor::Editor, motion, style};
 use gio::prelude::*;
 use gpui_kit::component::{
     ActiveTheme as _, Collapsible, Disableable as _, Icon, IconName, InteractiveElementExt as _,
-    Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT, Theme, ThemeMode, TitleBar, WindowExt as _,
-    button::{Button, ButtonVariants as _},
+    Selectable as _, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT, Theme, ThemeMode, TitleBar,
+    WindowExt as _,
+    button::{Button, ButtonGroup, ButtonVariants as _},
     dialog::{DialogButtonProps, DialogFooter},
     h_flex,
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
@@ -61,9 +62,9 @@ impl ThemeChoice {
 
     fn label(self) -> &'static str {
         match self {
-            Self::System => "System theme",
-            Self::Light => "Light theme",
-            Self::Dark => "Dark theme",
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
         }
     }
 
@@ -137,8 +138,14 @@ pub struct Shell {
     /// A press on the sidebar header that becomes a window move once the pointer moves.
     drag_armed: bool,
     editor: Option<WeakEntity<Editor>>,
+    /// The desktop's reduced-motion preference, read again every `MOTION_POLL` ticks.
+    motion: motion::Preference,
+    ticks: u32,
     _appearance: Subscription,
 }
+
+/// Pump ticks (100 ms each) between reads of the desktop's motion preference.
+const MOTION_POLL: u32 = 10;
 
 fn empty_snapshot() -> Snapshot {
     Snapshot {
@@ -225,6 +232,8 @@ impl Shell {
         };
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        let motion = motion::Preference::new();
+        motion.apply(cx);
         let mut shell = Self {
             autostart: paths.autostart.exists(),
             theme,
@@ -246,6 +255,8 @@ impl Shell {
             clearing: None,
             drag_armed: false,
             editor: None,
+            motion,
+            ticks: 0,
             _appearance: appearance,
         };
         shell.reconcile_selection(window, cx);
@@ -268,6 +279,10 @@ impl Shell {
     }
 
     fn pump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ticks = (self.ticks + 1) % MOTION_POLL;
+        if self.ticks == 0 {
+            self.motion.apply(cx);
+        }
         let mut actions = vec![];
         if let Some(incoming) = &self.incoming {
             while let Ok(line) = incoming.try_recv() {
@@ -523,10 +538,8 @@ impl Shell {
             Confirm {
                 title: format!("Clear cache for {name}?"),
                 detail: match size {
-                    Some(size) => format!(
-                        "Deletes {size} of local copies. Remote files are kept and download again when opened."
-                    ),
-                    None => "Deletes local copies. Remote files are kept and download again when opened.".into(),
+                    Some(size) => format!("Deletes {size} of local copies. Remote files are kept."),
+                    None => "Deletes local copies. Remote files are kept.".into(),
                 },
                 verb: "Clear cache",
                 back: "Cancel",
@@ -703,6 +716,70 @@ impl Shell {
         .detach();
     }
 
+    /// App-wide preferences. Each applies the moment it changes, so there is nothing to save.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shell = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (autostart, current) = {
+                let shell = shell.read(cx);
+                (shell.autostart, shell.theme)
+            };
+            let (login, theme, quit) = (shell.clone(), shell.clone(), shell.clone());
+            let login = Switch::new("start-at-login")
+                .checked(autostart)
+                .accessibility_label("Start at login")
+                .on_click(move |on: &bool, window, cx| {
+                    login.update(cx, |this, cx| this.set_autostart(*on, cx));
+                    window.refresh();
+                });
+            let themes = ButtonGroup::new("theme")
+                .outline()
+                .small()
+                .children(ThemeChoice::ALL.map(|choice| {
+                    // The chosen theme takes the primary fill: the shared selected wash is
+                    // too close to the control fill to read as a choice.
+                    let button = Button::new(choice.key())
+                        .label(choice.label())
+                        .selected(choice == current);
+                    if choice == current {
+                        button.primary()
+                    } else {
+                        button
+                    }
+                }))
+                .on_click(move |picked: &Vec<usize>, window, cx| {
+                    if let Some(&index) = picked.first() {
+                        let choice = ThemeChoice::ALL[index];
+                        theme.update(cx, |this, cx| this.set_theme(choice, window, cx));
+                        window.refresh();
+                    }
+                });
+            dialog
+                .title("Settings")
+                .entrance(motion::DIALOG)
+                .w(style::SETTINGS)
+                .child(
+                    // The title stands apart from the rows more than the rows from each other.
+                    v_flex()
+                        .pt_2()
+                        .gap_4()
+                        .child(setting_row("Start at login", login))
+                        .child(setting_row("Theme", themes)),
+                )
+                .footer(
+                    h_flex().w_full().child(
+                        Button::new("quit")
+                            .outline()
+                            .label("Quit Rclone Tray…")
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                quit.update(cx, |this, cx| this.quit(window, cx));
+                            }),
+                    ),
+                )
+        });
+    }
+
     // MARK: Actions bound to keys
 
     fn on_add(&mut self, _: &AddMount, window: &mut Window, cx: &mut Context<Self>) {
@@ -867,48 +944,12 @@ impl Shell {
     /// The sidebar's header: app-wide actions. It drags the window like a title bar does.
     fn render_sidebar_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = matches!(self.link, Link::Connected(..));
-        let this = cx.entity().downgrade();
-        let autostart = self.autostart;
-        let current = self.theme;
         let settings = Button::new("settings")
             .ghost()
             .small()
             .icon(IconName::Settings)
             .tooltip("Settings")
-            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-                let (refresh, login, quit) = (this.clone(), this.clone(), this.clone());
-                let mut menu = menu
-                    .item(
-                        PopupMenuItem::new("Refresh remotes").on_click(move |_, window, cx| {
-                            let _ = refresh
-                                .update(cx, |this, cx| this.on_refresh(&Refresh, window, cx));
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new("Start at login")
-                            .checked(autostart)
-                            .on_click(move |_, _, cx| {
-                                let _ =
-                                    login.update(cx, |this, cx| this.set_autostart(!autostart, cx));
-                            }),
-                    )
-                    .separator();
-                for choice in ThemeChoice::ALL {
-                    let this = this.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(choice.label())
-                            .checked(choice == current)
-                            .on_click(move |_, window, cx| {
-                                let _ =
-                                    this.update(cx, |this, cx| this.set_theme(choice, window, cx));
-                            }),
-                    );
-                }
-                menu.separator()
-                    .item(PopupMenuItem::new("Quit…").on_click(move |_, window, cx| {
-                        let _ = quit.update(cx, |this, cx| this.quit(window, cx));
-                    }))
-            });
+            .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)));
         let add = Button::new("add")
             .ghost()
             .small()
@@ -1152,11 +1193,6 @@ impl Shell {
             .gap_4()
             .px(style::INSET)
             .child(
-                Icon::new(IconName::HardDrive)
-                    .size(px(32.))
-                    .text_color(style::muted(cx)),
-            )
-            .child(
                 v_flex()
                     .items_center()
                     .gap_1()
@@ -1168,7 +1204,7 @@ impl Shell {
                     )
                     .children(error.map(|error| {
                         div()
-                            .max_w(px(420.))
+                            .max_w(style::MEASURE)
                             .text_sm()
                             .text_center()
                             .text_color(cx.theme().danger)
@@ -1194,11 +1230,6 @@ impl Shell {
             .justify_center()
             .gap_4()
             .px(style::INSET)
-            .child(
-                Icon::new(IconName::HardDrive)
-                    .size(px(32.))
-                    .text_color(style::muted(cx)),
-            )
             .child(
                 v_flex()
                     .items_center()
@@ -1298,11 +1329,11 @@ impl Shell {
             .child(fact(
                 "Folder",
                 view::short_path(&profile.mountpoint, self.home.as_deref()),
-                true,
+                Give::Fill,
                 cx,
             ))
-            .child(fact("Remote", view::remote_path(&profile), true, cx))
-            .child(fact("Cache", cache, false, cx));
+            .child(fact("Remote", view::remote_path(&profile), Give::Share, cx))
+            .child(fact("Cache", cache, Give::Never, cx));
 
         let count = |pane: &view::QueuePane| (!pane.rows.is_empty()).then_some(pane.rows.len());
         let tab = |label: &'static str, count: Option<usize>, cx: &App| {
@@ -1349,45 +1380,57 @@ impl Shell {
 
         let pane = match self.pane {
             Pane::Uploads => self
-                .render_queue(id, true, queues.uploads, cx)
+                .render_queue(id, true, queues.uploads, window, cx)
                 .into_any_element(),
             Pane::Downloads => self
-                .render_queue(id, false, queues.downloads, cx)
+                .render_queue(id, false, queues.downloads, window, cx)
                 .into_any_element(),
             Pane::Log => self.render_log(window, cx).into_any_element(),
         };
 
+        let header = v_flex()
+            .px(style::INSET)
+            .pt_1()
+            .pb_4()
+            .gap_3()
+            .when_some(problem, |this, problem| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .text_sm()
+                        .text_color(style::tone(tone, cx))
+                        .when(matches!(tone, Tone::Warning | Tone::Danger), |this| {
+                            this.child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .small()
+                                    .flex_shrink_0()
+                                    .mt(style::ICON_BASELINE),
+                            )
+                        })
+                        .child(div().flex_1().min_w_0().child(problem)),
+                )
+            })
+            .child(summary);
+        // Another mount reveals its facts and pane together, in the same frame; another tab
+        // reveals only the pane. Live updates keep the keys, so they never replay the motion.
+        let pane = v_flex().flex_1().min_h_0().child(pane);
         v_flex()
             .flex_1()
             .min_h_0()
-            .child(
-                v_flex()
-                    .px(style::INSET)
-                    .pt_1()
-                    .pb_4()
-                    .gap_3()
-                    .when_some(problem, |this, problem| {
-                        this.child(
-                            h_flex()
-                                .gap_2()
-                                .items_start()
-                                .text_sm()
-                                .text_color(style::tone(tone, cx))
-                                .when(matches!(tone, Tone::Warning | Tone::Danger), |this| {
-                                    this.child(
-                                        Icon::new(IconName::TriangleAlert)
-                                            .small()
-                                            .flex_shrink_0()
-                                            .mt(px(2.)),
-                                    )
-                                })
-                                .child(div().flex_1().min_w_0().child(problem)),
-                        )
-                    })
-                    .child(summary),
-            )
+            .child(motion::reveal(
+                ElementId::NamedInteger("mount-facts".into(), id),
+                header,
+                window,
+                cx,
+            ))
             .child(tabs)
-            .child(pane)
+            .child(motion::reveal(
+                ElementId::Name(format!("pane-{id}-{selected}").into()),
+                pane,
+                window,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -1396,6 +1439,7 @@ impl Shell {
         id: u64,
         uploads: bool,
         pane: view::QueuePane,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if pane.rows.is_empty() {
@@ -1408,10 +1452,13 @@ impl Shell {
                 .text_sm()
                 .text_color(style::muted(cx))
                 .children(pane.facts)
-                .children(
-                    pane.hint
-                        .map(|hint| div().text_xs().max_w(px(420.)).text_center().child(hint)),
-                )
+                .children(pane.hint.map(|hint| {
+                    div()
+                        .text_xs()
+                        .max_w(style::MEASURE)
+                        .text_center()
+                        .child(hint)
+                }))
                 .into_any_element();
         }
         let count = pane.rows.len();
@@ -1436,15 +1483,18 @@ impl Shell {
             .children(batch.and_then(view::UploadBatch::summary))
             .children(batch.and_then(view::UploadBatch::time_left))
             .children(pane.hint)
-            .children(
-                batch
-                    .and_then(view::UploadBatch::progress)
-                    .map(|fraction| progress_rail(fraction, cx)),
-            );
+            .children(batch.and_then(view::UploadBatch::progress).map(|fraction| {
+                progress_rail(
+                    ElementId::NamedInteger("batch-rail".into(), id),
+                    fraction,
+                    window,
+                    cx,
+                )
+            }));
         let list = uniform_list(
             "queue",
             count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+            cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                 let queues = view::queues(&this.state, id);
                 let rows = if uploads {
                     queues.uploads.rows
@@ -1453,7 +1503,7 @@ impl Shell {
                 };
                 range
                     .filter_map(|index| rows.get(index).cloned())
-                    .map(|row| queue_row(row, cx).into_any_element())
+                    .map(|row| queue_row(row, window, cx).into_any_element())
                     .collect::<Vec<_>>()
             }),
         )
@@ -1504,7 +1554,16 @@ impl Shell {
     }
 }
 
-fn queue_row(row: view::QueueRow, cx: &App) -> impl IntoElement {
+fn queue_row(row: view::QueueRow, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    // Keyed by file, so a rail keeps gliding while rows reorder or scroll.
+    let rail = (row.progress > 0.0).then(|| {
+        progress_rail(
+            ElementId::Name(format!("rail-{}", row.name).into()),
+            row.progress,
+            window,
+            cx,
+        )
+    });
     div()
         .relative()
         .w_full()
@@ -1524,29 +1583,57 @@ fn queue_row(row: view::QueueRow, cx: &App) -> impl IntoElement {
                 .text_color(style::muted(cx))
                 .children(row.facts),
         )
-        .when(row.progress > 0.0, |this| {
-            this.child(progress_rail(row.progress, cx))
-        })
+        .children(rail)
 }
 
-/// A labelled fact about the selected mount. Paths give way first, keeping their end visible.
-fn fact(label: &'static str, value: String, path: bool, cx: &App) -> impl IntoElement {
+/// A preference: its name on the left, its control on the right edge.
+fn setting_row(label: &'static str, control: impl IntoElement) -> impl IntoElement {
+    h_flex()
+        .gap_4()
+        .justify_between()
+        .child(div().text_sm().child(label))
+        .child(control)
+}
+
+/// How a fact gives up width when the row is too narrow for every value.
+#[derive(Clone, Copy)]
+enum Give {
+    /// Takes the space left over and truncates first: the long local path.
+    Fill,
+    /// Keeps its natural width up to a share of the row, then truncates: the remote path.
+    Share,
+    /// Always shown in full: short values such as the cache size.
+    Never,
+}
+
+/// A labelled fact about the selected mount. Paths keep their end visible when they truncate.
+fn fact(label: &'static str, value: String, give: Give, cx: &App) -> impl IntoElement {
     v_flex()
         .gap_0p5()
-        .when(path, |this| this.min_w_0())
-        .when(!path, |this| this.flex_shrink_0())
-        .child(div().text_xs().text_color(style::muted(cx)).child(label))
+        .map(|this| match give {
+            Give::Fill => this.flex_1().min_w_0(),
+            Give::Share => this.flex_shrink_0().min_w_0().max_w(relative(0.4)),
+            Give::Never => this.flex_shrink_0(),
+        })
+        .child(
+            div()
+                .whitespace_nowrap()
+                .text_xs()
+                .text_color(style::muted(cx))
+                .child(label),
+        )
         .child(style::path(div()).text_sm().child(value))
 }
 
-/// The row's lower edge fills with the progress of its transfers.
-fn progress_rail(fraction: f64, cx: &App) -> impl IntoElement {
+/// The row's lower edge fills with the progress of its transfers, gliding between samples.
+fn progress_rail(key: ElementId, fraction: f64, window: &mut Window, cx: &mut App) -> Div {
+    let shown = motion::fill(key, fraction, window, cx);
     div()
         .absolute()
         .left_0()
         .bottom_0()
         .h(style::RAIL)
-        .w(relative(fraction as f32))
+        .w(relative(shown))
         .bg(style::rail(cx))
 }
 
@@ -1624,10 +1711,13 @@ impl SidebarItem for MountItem {
                 .text_sm()
                 .cursor_pointer()
                 .map(|this| {
+                    // Hover previews, press answers on contact, selection persists: three
+                    // distinct steps of the same material, none of them moving the row.
                     if self.selected {
                         this.font_medium().bg(accent).text_color(accent_text)
                     } else {
-                        this.hover(move |this| this.bg(accent.opacity(0.8)))
+                        this.hover(move |this| this.bg(accent.opacity(0.5)))
+                            .active(move |this| this.bg(accent))
                     }
                 })
                 .child(self.icon.flex_shrink_0())
@@ -1682,7 +1772,8 @@ fn confirm(
             });
         dialog
             .title(request.title.clone())
-            .w(px(400.))
+            .entrance(motion::DIALOG)
+            .w(style::CONFIRM)
             .child(
                 div()
                     .text_sm()

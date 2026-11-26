@@ -4,6 +4,7 @@ use rclone_tray::{config::Paths, ipc, tray::Action};
 use std::borrow::Cow;
 
 mod editor;
+mod motion;
 mod style;
 mod ui;
 

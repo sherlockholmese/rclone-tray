@@ -440,10 +440,13 @@ fn upload_pane(activity: &Activity) -> QueuePane {
         Ok(queue) if queue.is_empty() => pane.facts = vec!["No queued uploads".into()],
         Ok(queue) => {
             let active = queue.iter().filter(|item| item.uploading).count();
-            pane.facts = vec![
-                format!("{active} uploading"),
-                format!("{} queued", queue.len() - active),
-            ];
+            // A zero count says nothing the other count does not.
+            let idle = queue.len() - active;
+            pane.facts = [(active, "uploading"), (idle, "queued")]
+                .into_iter()
+                .filter(|(count, _)| *count > 0)
+                .map(|(count, label)| format!("{count} {label}"))
+                .collect();
             for item in queue {
                 if let Some(transfer) = activity
                     .transfers
@@ -893,7 +896,7 @@ mod tests {
         mixed.transfers = vec![transfer(1000, 500)];
         state.activity.insert(1, Ok(mixed));
         let pane = queues(&state, 1).uploads;
-        assert_eq!(pane.facts, ["0 uploading", "2 queued"]);
+        assert_eq!(pane.facts, ["2 queued"]);
         assert_eq!(pane.rows[0].name, "report.pdf");
         assert_eq!(pane.rows[1].facts, ["1.0 KiB", "Waiting for a slot"]);
     }

@@ -16,6 +16,16 @@ pub const QUEUE_ROW: Pixels = px(52.);
 pub const PLATE_GAP: Pixels = px(8.);
 /// The information-bearing progress rail along a row's lower edge.
 pub const RAIL: Pixels = px(2.);
+/// Longest line for centred prose such as empty states and errors.
+pub const MEASURE: Pixels = px(420.);
+/// Width of a confirmation dialog: a title, one sentence, two actions.
+pub const CONFIRM: Pixels = px(400.);
+/// Width of the settings dialog: two preference rows.
+pub const SETTINGS: Pixels = px(400.);
+/// Width of the mount editor, which fits three short fields on one row.
+pub const EDITOR: Pixels = px(480.);
+/// Drops a small icon onto the first line of the text beside it.
+pub const ICON_BASELINE: Pixels = px(2.);
 
 /// The window behind the content plate. The sidebar sits directly on it.
 pub fn canvas(cx: &App) -> Hsla {
