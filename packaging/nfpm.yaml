@@ -1,0 +1,87 @@
+# Builds .deb, .rpm, and Arch (.pkg.tar.zst) packages from release binaries.
+# CI sets VERSION and ARCH (amd64 or arm64); nfpm names each format's architecture itself.
+#   nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
+name: rclone-tray
+version: ${VERSION}
+arch: ${ARCH}
+platform: linux
+section: utils
+priority: optional
+maintainer: sherlockholmese <sherlockholmese@users.noreply.github.com>
+description: |
+  Tray application for mounting configured rclone remotes as local folders,
+  with a GPUI settings window.
+homepage: https://github.com/sherlockholmese/rclone-tray
+
+contents:
+  - src: target/release/rclone-tray
+    dst: /usr/bin/rclone-tray
+    file_info:
+      mode: 0755
+  - src: target/release/rclone-tray-ui
+    dst: /usr/bin/rclone-tray-ui
+    file_info:
+      mode: 0755
+  - src: data/io.github.rclone_tray.App.desktop
+    dst: /usr/share/applications/io.github.rclone_tray.App.desktop
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/rclone-tray/README.md
+    file_info:
+      mode: 0644
+
+# The settings window is GPUI: it links xcb/xkbcommon and loads Wayland, Vulkan, and
+# fontconfig at runtime. GLib provides gio for notifications and opening folders.
+overrides:
+  deb:
+    depends:
+      - libglib2.0-0t64 | libglib2.0-0
+      - libxcb1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libvulkan1
+      - libfontconfig1
+      - libfreetype6
+      - rclone
+      - fuse3
+    recommends:
+      - mesa-vulkan-drivers
+  rpm:
+    depends:
+      - glib2
+      - libxcb
+      - libxkbcommon
+      - libxkbcommon-x11
+      - libwayland-client
+      - vulkan-loader
+      - fontconfig
+      - freetype
+      - rclone
+      - fuse3
+  archlinux:
+    depends:
+      - glib2
+      - libxcb
+      - libxkbcommon
+      - libxkbcommon-x11
+      - wayland
+      - vulkan-icd-loader
+      - fontconfig
+      - rclone
+      - fuse3
+      - util-linux
+    suggests:
+      - gnome-shell-extension-appindicator
+      - vulkan-driver
+
+rpm:
+  summary: Mount configured rclone remotes from the system tray
+  compression: zstd
+
+deb:
+  compression: zstd
+
+archlinux:
+  packager: sherlockholmese <sherlockholmese@users.noreply.github.com>

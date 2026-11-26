@@ -18,6 +18,21 @@ On Arch Linux: `sudo pacman -S rust glib2 libxkbcommon-x11 wayland vulkan-icd-lo
 On Debian/Ubuntu: install `libglib2.0-dev libxkbcommon-x11-dev libwayland-dev libvulkan1 libfontconfig-dev rclone fuse3 pkg-config build-essential`
 and a sufficiently recent Rust toolchain through rustup.
 
+## Install
+
+Each [release](https://github.com/sherlockholmese/rclone-tray/releases) has packages for
+x86_64 and aarch64, built on Ubuntu 24.04 (glibc 2.39 or newer):
+
+```sh
+sudo apt install ./rclone-tray_*_amd64.deb             # Debian 13+, Ubuntu 24.04+
+sudo dnf install ./rclone-tray-*.x86_64.rpm             # Fedora 40+
+sudo pacman -U ./rclone-tray-*-x86_64.pkg.tar.zst       # Arch Linux
+```
+
+A plain tarball holds both binaries; keep them in the same directory. Every file has a
+matching `.sha256`. Pushing a `v*` tag that matches the version in `Cargo.toml` and
+`packaging/arch/PKGBUILD` publishes a release through `.github/workflows/release.yml`.
+
 ## Run
 
 ```sh
@@ -47,8 +62,9 @@ mount's folder, remote, and cache use, then **Uploads**, **Downloads**, and **Lo
 Queues list file names, transferred bytes, speeds, and progress when the size is known, with
 moving files first; the queue's summary line and each row's lower edge fill with progress.
 Waiting uploads show their size, delay, and retry attempts. Unknown file sizes are left out
-rather than estimated. **Add mount** (Ctrl+N) and the settings menu sit at the top of the
-sidebar: **Refresh remotes** (F5), **Start at login**, theme, and **Quit…** (Ctrl+Q). Downloads are on demand: rclone exposes active downloads, not a waiting download
+rather than estimated. **Add mount** (Ctrl+N) and **Settings** sit at the top of the
+sidebar. Settings holds **Start at login**, the theme, and **Quit Rclone Tray…** (Ctrl+Q).
+The mount editor refreshes remotes beside its remote picker (F5 anywhere in the window). Downloads are on demand: rclone exposes active downloads, not a waiting download
 queue. Missing queue data is shown as unavailable, never as an empty queue. Polling runs
 off the UI thread, roughly once per second; lists are virtualized for large queues.
 The tray tooltip and menu show the same summary, including startup recovery. Each mount's menu

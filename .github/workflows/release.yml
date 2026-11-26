@@ -1,0 +1,167 @@
+name: Release
+
+# Push a tag such as v0.2.0 to build, test, and publish a release: a tarball plus .deb,
+# .rpm, and Arch packages for x86_64 and aarch64, each with a SHA-256 file.
+# Run it by hand from the Actions tab to build the same artifacts without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  NFPM_VERSION: 2.49.0
+  # The libraries GPUI, GIO, and fontconfig link against at build time.
+  APT_PACKAGES: >-
+    pkg-config libglib2.0-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev
+    libx11-xcb-dev libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev
+    desktop-file-utils
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        name: Compare tag, Cargo.toml, and PKGBUILD
+        run: |
+          cargo=$(awk -F'"' '/^version = / {print $2; exit}' Cargo.toml)
+          pkgbuild=$(awk -F= '$1 == "pkgver" {print $2; exit}' packaging/arch/PKGBUILD)
+          echo "Cargo.toml: $cargo, PKGBUILD: $pkgbuild"
+          if [ "$cargo" != "$pkgbuild" ]; then
+            echo "::error::Cargo.toml ($cargo) and PKGBUILD ($pkgbuild) disagree"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$cargo" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version v$cargo"
+            exit 1
+          fi
+          echo "version=$cargo" >> "$GITHUB_OUTPUT"
+
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            goarch: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      NAME: rclone-tray-${{ needs.version.outputs.version }}-${{ matrix.arch }}-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - run: desktop-file-validate data/io.github.rclone_tray.App.desktop
+
+      - run: strip target/release/rclone-tray target/release/rclone-tray-ui
+
+      # Both binaries stay side by side: the settings window starts the backend from its
+      # own directory.
+      - name: Tarball
+        run: |
+          mkdir -p "dist/$NAME"
+          install -m755 target/release/rclone-tray target/release/rclone-tray-ui "dist/$NAME/"
+          install -m644 data/io.github.rclone_tray.App.desktop README.md "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          rm -r "dist/$NAME"
+
+      - name: Install nfpm
+        run: |
+          case "${{ matrix.goarch }}" in amd64) asset=x86_64 ;; arm64) asset=arm64 ;; esac
+          base="https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION"
+          file="nfpm_${NFPM_VERSION}_Linux_${asset}.tar.gz"
+          curl -sSLf -o "$RUNNER_TEMP/$file" "$base/$file"
+          curl -sSLf -o "$RUNNER_TEMP/checksums.txt" "$base/checksums.txt"
+          (cd "$RUNNER_TEMP" && grep " $file\$" checksums.txt | sha256sum -c -)
+          tar -xzf "$RUNNER_TEMP/$file" -C "$RUNNER_TEMP" nfpm
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: deb, rpm, and pacman packages
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.goarch }}
+        run: |
+          for packager in deb rpm archlinux; do
+            nfpm package --config packaging/nfpm.yaml --packager "$packager" --target dist/
+          done
+
+      - name: Checksums
+        working-directory: dist
+        run: for file in *; do sha256sum "$file" > "$file.sha256"; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Inspect packages
+        working-directory: dist
+        run: |
+          ls -la
+          dpkg-deb --info ./*.deb
+          dpkg-deb --contents ./*.deb
+
+  release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: [version, lint, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # A tag with a suffix, such as v0.2.0-rc.1, publishes a prerelease.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Rclone Tray ${{ needs.version.outputs.version }}" \
+            --generate-notes --verify-tag "${prerelease[@]}"
